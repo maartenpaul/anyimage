@@ -24,21 +24,29 @@ def _array_to_base64(data: np.ndarray) -> str:
     from PIL import Image
 
     if data.ndim == 2:
-        img = Image.fromarray(data, mode='L')
+        img = Image.fromarray(data, mode="L")
     elif data.ndim == 3 and data.shape[2] == 3:
-        img = Image.fromarray(data, mode='RGB')
+        img = Image.fromarray(data, mode="RGB")
     elif data.ndim == 3 and data.shape[2] == 4:
-        img = Image.fromarray(data, mode='RGBA')
+        img = Image.fromarray(data, mode="RGBA")
     else:
         raise ValueError(f"Unsupported array shape: {data.shape}")
 
     buffer = BytesIO()
-    img.save(buffer, format='PNG')
-    return base64.b64encode(buffer.getvalue()).decode('utf-8')
+    img.save(buffer, format="PNG")
+    return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
 
-def _labels_to_rgba(labels: np.ndarray) -> np.ndarray:
-    """Convert label array to RGBA with unique colors per label."""
+def _labels_to_rgba(
+    labels: np.ndarray, contours_only: bool = False, contour_width: int = 1
+) -> np.ndarray:
+    """Convert label array to RGBA with unique colors per label.
+
+    Args:
+        labels: 2D array of label values
+        contours_only: If True, only draw contours instead of filled regions
+        contour_width: Width of contour lines in pixels (only used if contours_only=True)
+    """
     height, width = labels.shape[:2]
     rgba = np.zeros((height, width, 4), dtype=np.uint8)
 
@@ -52,16 +60,47 @@ def _labels_to_rgba(labels: np.ndarray) -> np.ndarray:
         g = (seed >> 8) & 0xFF
         b = seed & 0xFF
         mask = labels == label
-        rgba[mask, 0] = r
-        rgba[mask, 1] = g
-        rgba[mask, 2] = b
-        rgba[mask, 3] = 255
+
+        if contours_only:
+            # Detect boundaries using morphological gradient
+            from scipy import ndimage
+
+            # Create binary mask for this label
+            binary_mask = mask.astype(np.uint8)
+            # Dilate and subtract to get boundary
+            dilated = ndimage.binary_dilation(binary_mask, iterations=contour_width)
+            eroded = ndimage.binary_erosion(binary_mask, iterations=1)
+            boundary = dilated & ~eroded
+
+            rgba[boundary, 0] = r
+            rgba[boundary, 1] = g
+            rgba[boundary, 2] = b
+            rgba[boundary, 3] = 255
+        else:
+            # Fill entire region
+            rgba[mask, 0] = r
+            rgba[mask, 1] = g
+            rgba[mask, 2] = b
+            rgba[mask, 3] = 255
 
     return rgba
 
 
 class BioImageViewer(anywidget.AnyWidget):
     """Anywidget for viewing bioimages with label mask overlays."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._labels_array = None  # Store original labels for regeneration
+        self._mask_cache = {}  # Cache for filled and contour versions
+        # Set up observers for contour settings
+        self.observe(
+            self._on_contour_settings_changed, names=["show_contours", "contour_width"]
+        )
+
+    def _on_contour_settings_changed(self, change):
+        """Called when contour settings change - regenerate mask."""
+        self._regenerate_mask()
 
     _esm = """
     async function loadImage(base64Data) {
@@ -107,6 +146,19 @@ class BioImageViewer(anywidget.AnyWidget):
         maskToggle.appendChild(maskCheck);
         maskToggle.appendChild(document.createTextNode(' Mask'));
 
+        // Contours toggle
+        const contoursToggle = document.createElement('label');
+        contoursToggle.className = 'toggle';
+        const contoursCheck = document.createElement('input');
+        contoursCheck.type = 'checkbox';
+        contoursCheck.checked = model.get('show_contours');
+        contoursCheck.addEventListener('change', () => {
+            model.set('show_contours', contoursCheck.checked);
+            model.save_changes();
+        });
+        contoursToggle.appendChild(contoursCheck);
+        contoursToggle.appendChild(document.createTextNode(' Contours'));
+
         // ROIs toggle
         const roisToggle = document.createElement('label');
         roisToggle.className = 'toggle';
@@ -138,6 +190,7 @@ class BioImageViewer(anywidget.AnyWidget):
 
         controls.appendChild(imageToggle);
         controls.appendChild(maskToggle);
+        controls.appendChild(contoursToggle);
         controls.appendChild(roisToggle);
         controls.appendChild(opacityLabel);
 
@@ -423,6 +476,9 @@ class BioImageViewer(anywidget.AnyWidget):
         model.on('change:mask_visible', renderCanvas);
         model.on('change:rois_visible', renderCanvas);
         model.on('change:mask_opacity', renderCanvas);
+        model.on('change:show_contours', () => {
+            contoursCheck.checked = model.get('show_contours');
+        });
         model.on('change:_rois_data', renderCanvas);
         model.on('change:roi_color', renderCanvas);
         model.on('change:width', resetView);
@@ -523,28 +579,30 @@ class BioImageViewer(anywidget.AnyWidget):
     image_visible = traitlets.Bool(True).tag(sync=True)
     mask_visible = traitlets.Bool(True).tag(sync=True)
     mask_opacity = traitlets.Float(0.5).tag(sync=True)
+    show_contours = traitlets.Bool(False).tag(sync=True)
+    contour_width = traitlets.Int(1).tag(sync=True)
 
     # Image dimensions
     width = traitlets.Int(0).tag(sync=True)
     height = traitlets.Int(0).tag(sync=True)
 
     # ROI annotation
-    tool_mode = traitlets.Unicode('pan').tag(sync=True)  # 'pan' or 'draw'
+    tool_mode = traitlets.Unicode("pan").tag(sync=True)  # 'pan' or 'draw'
     _rois_data = traitlets.List(traitlets.Dict()).tag(sync=True)
     rois_visible = traitlets.Bool(True).tag(sync=True)
-    roi_color = traitlets.Unicode('#ff0000').tag(sync=True)
+    roi_color = traitlets.Unicode("#ff0000").tag(sync=True)
 
     @property
     def rois_df(self) -> pd.DataFrame:
         """Get ROIs as a pandas DataFrame."""
         if not self._rois_data:
-            return pd.DataFrame(columns=['id', 'x', 'y', 'width', 'height'])
+            return pd.DataFrame(columns=["id", "x", "y", "width", "height"])
         return pd.DataFrame(self._rois_data)
 
     @rois_df.setter
     def rois_df(self, df: pd.DataFrame):
         """Set ROIs from a pandas DataFrame."""
-        self._rois_data = df.to_dict('records')
+        self._rois_data = df.to_dict("records")
 
     def clear_rois(self):
         """Clear all ROIs."""
@@ -562,13 +620,75 @@ class BioImageViewer(anywidget.AnyWidget):
         normalized = _normalize_image(data)
         self.image_data = _array_to_base64(normalized)
 
-    def set_mask(self, labels: np.ndarray):
-        """Set the label mask from a numpy array."""
+    def set_mask(
+        self,
+        labels: np.ndarray,
+        contours_only: bool | None = None,
+        contour_width: int | None = None,
+    ):
+        """Set the label mask from a numpy array.
+
+        Args:
+            labels: 2D numpy array of label values
+            contours_only: If True, show only contours. If None, uses self.show_contours
+            contour_width: Width of contours in pixels. If None, uses self.contour_width
+        """
         if labels.ndim > 2:
             labels = labels.squeeze()
             if labels.ndim > 2:
                 labels = labels[0] if labels.ndim == 3 else labels[0, 0]
 
-        # Convert labels to pre-colored RGBA (handles arbitrary label counts)
-        rgba = _labels_to_rgba(labels)
-        self.mask_data = _array_to_base64(rgba)
+        # Store original labels for later regeneration
+        self._labels_array = labels
+
+        # Clear cache when new labels are set
+        self._mask_cache = {}
+
+        # Use instance attributes if not specified
+        use_contours = (
+            contours_only if contours_only is not None else self.show_contours
+        )
+        use_width = contour_width if contour_width is not None else self.contour_width
+
+        # Generate the requested version immediately for instant display
+        current_key = (use_contours, use_width)
+        rgba_current = _labels_to_rgba(
+            labels, contours_only=use_contours, contour_width=use_width
+        )
+        self._mask_cache[current_key] = _array_to_base64(rgba_current)
+        self.mask_data = self._mask_cache[current_key]
+
+        # Pre-generate the other version asynchronously in background
+        import threading
+
+        other_key = (not use_contours, use_width)
+
+        def _pregenerate_other():
+            rgba_other = _labels_to_rgba(
+                labels, contours_only=not use_contours, contour_width=use_width
+            )
+            self._mask_cache[other_key] = _array_to_base64(rgba_other)
+
+        # Start background thread to pre-generate the alternate version
+        thread = threading.Thread(target=_pregenerate_other, daemon=True)
+        thread.start()
+
+    def _regenerate_mask(self):
+        """Regenerate mask from cached or stored labels array."""
+        if self._labels_array is None:
+            return
+
+        cache_key = (self.show_contours, self.contour_width)
+
+        # Check if we have it cached
+        if cache_key in self._mask_cache:
+            self.mask_data = self._mask_cache[cache_key]
+        else:
+            # Generate and cache if not available
+            rgba = _labels_to_rgba(
+                self._labels_array,
+                contours_only=self.show_contours,
+                contour_width=self.contour_width,
+            )
+            self._mask_cache[cache_key] = _array_to_base64(rgba)
+            self.mask_data = self._mask_cache[cache_key]

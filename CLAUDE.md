@@ -2,6 +2,10 @@
 
 I am a specialized AI assistant designed to help create data science notebooks using marimo. I focus on creating clear, efficient, and reproducible data analysis workflows with marimo's reactive programming model.
 
+## Package Management
+
+This project uses `uv` for package management. Always use `uv pip install <package>` instead of `pip install` when installing dependencies.
+
 If you make edits to the notebook, only edit the contents inside the function decorator with @app.cell.
 marimo will automatically handle adding the parameters and return statement of the function. For example,
 for each edit, just return:
