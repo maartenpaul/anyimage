@@ -40,21 +40,14 @@ def _array_to_base64(data: np.ndarray) -> str:
 def _labels_to_rgba(
     labels: np.ndarray, contours_only: bool = False, contour_width: int = 1
 ) -> np.ndarray:
-    """Convert label array to RGBA with unique colors per label.
-
-    Args:
-        labels: 2D array of label values
-        contours_only: If True, only draw contours instead of filled regions
-        contour_width: Width of contour lines in pixels (only used if contours_only=True)
-    """
+    """Convert label array to RGBA with unique colors per label."""
     height, width = labels.shape[:2]
     rgba = np.zeros((height, width, 4), dtype=np.uint8)
 
     unique_labels = np.unique(labels)
     for label in unique_labels:
         if label == 0:
-            continue  # Keep background transparent
-        # Deterministic color using same hash as JS
+            continue
         seed = int(label) * 2654435761
         r = (seed >> 16) & 0xFF
         g = (seed >> 8) & 0xFF
@@ -62,22 +55,16 @@ def _labels_to_rgba(
         mask = labels == label
 
         if contours_only:
-            # Detect boundaries using morphological gradient
             from scipy import ndimage
-
-            # Create binary mask for this label
             binary_mask = mask.astype(np.uint8)
-            # Dilate and subtract to get boundary
             dilated = ndimage.binary_dilation(binary_mask, iterations=contour_width)
             eroded = ndimage.binary_erosion(binary_mask, iterations=1)
             boundary = dilated & ~eroded
-
             rgba[boundary, 0] = r
             rgba[boundary, 1] = g
             rgba[boundary, 2] = b
             rgba[boundary, 3] = 255
         else:
-            # Fill entire region
             rgba[mask, 0] = r
             rgba[mask, 1] = g
             rgba[mask, 2] = b
@@ -86,21 +73,20 @@ def _labels_to_rgba(
     return rgba
 
 
+# Default colors for mask layers
+MASK_COLORS = [
+    "#ff6b6b", "#4ecdc4", "#45b7d1", "#96ceb4", "#ffeaa7",
+    "#dfe6e9", "#fd79a8", "#a29bfe", "#6c5ce7", "#00b894"
+]
+
+
 class BioImageViewer(anywidget.AnyWidget):
-    """Anywidget for viewing bioimages with label mask overlays."""
+    """Anywidget for viewing bioimages with multiple mask layers and annotation tools."""
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self._labels_array = None  # Store original labels for regeneration
-        self._mask_cache = {}  # Cache for filled and contour versions
-        # Set up observers for contour settings
-        self.observe(
-            self._on_contour_settings_changed, names=["show_contours", "contour_width"]
-        )
-
-    def _on_contour_settings_changed(self, change):
-        """Called when contour settings change - regenerate mask."""
-        self._regenerate_mask()
+        self._mask_arrays = {}  # Store raw label arrays by mask id
+        self._mask_caches = {}  # Cache rendered versions by mask id
 
     _esm = """
     async function loadImage(base64Data) {
@@ -112,120 +98,272 @@ class BioImageViewer(anywidget.AnyWidget):
         });
     }
 
+    const ICONS = {
+        pan: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 11V6a2 2 0 0 0-2-2v0a2 2 0 0 0-2 2v0"/><path d="M14 10V4a2 2 0 0 0-2-2v0a2 2 0 0 0-2 2v2"/><path d="M10 10.5V6a2 2 0 0 0-2-2v0a2 2 0 0 0-2 2v8"/><path d="M18 8a2 2 0 1 1 4 0v6a8 8 0 0 1-8 8h-2c-2.8 0-4.5-.86-5.99-2.34l-3.6-3.6a2 2 0 0 1 2.83-2.82L7 15"/></svg>',
+        select: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m3 3 7.07 16.97 2.51-7.39 7.39-2.51L3 3z"/><path d="m13 13 6 6"/></svg>',
+        rect: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/></svg>',
+        polygon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2l8 5v10l-8 5-8-5V7l8-5z"/></svg>',
+        point: '<svg viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="12" r="4"/><circle cx="12" cy="12" r="8" fill="none" stroke="currentColor" stroke-width="2"/></svg>',
+        reset: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>',
+        trash: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>',
+        eye: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>',
+        eyeOff: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>',
+        layers: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>',
+        mask: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M9 21V9"/></svg>'
+    };
+
     async function render({ model, el }) {
         const container = document.createElement('div');
         container.className = 'bioimage-viewer';
+        container.tabIndex = 0;
 
-        // Controls row 1: layers
-        const controls = document.createElement('div');
-        controls.className = 'controls';
-
-        // Image toggle
-        const imageToggle = document.createElement('label');
-        imageToggle.className = 'toggle';
-        const imageCheck = document.createElement('input');
-        imageCheck.type = 'checkbox';
-        imageCheck.checked = model.get('image_visible');
-        imageCheck.addEventListener('change', () => {
-            model.set('image_visible', imageCheck.checked);
-            model.save_changes();
-        });
-        imageToggle.appendChild(imageCheck);
-        imageToggle.appendChild(document.createTextNode(' Image'));
-
-        // Mask toggle
-        const maskToggle = document.createElement('label');
-        maskToggle.className = 'toggle';
-        const maskCheck = document.createElement('input');
-        maskCheck.type = 'checkbox';
-        maskCheck.checked = model.get('mask_visible');
-        maskCheck.addEventListener('change', () => {
-            model.set('mask_visible', maskCheck.checked);
-            model.save_changes();
-        });
-        maskToggle.appendChild(maskCheck);
-        maskToggle.appendChild(document.createTextNode(' Mask'));
-
-        // Contours toggle
-        const contoursToggle = document.createElement('label');
-        contoursToggle.className = 'toggle';
-        const contoursCheck = document.createElement('input');
-        contoursCheck.type = 'checkbox';
-        contoursCheck.checked = model.get('show_contours');
-        contoursCheck.addEventListener('change', () => {
-            model.set('show_contours', contoursCheck.checked);
-            model.save_changes();
-        });
-        contoursToggle.appendChild(contoursCheck);
-        contoursToggle.appendChild(document.createTextNode(' Contours'));
-
-        // ROIs toggle
-        const roisToggle = document.createElement('label');
-        roisToggle.className = 'toggle';
-        const roisCheck = document.createElement('input');
-        roisCheck.type = 'checkbox';
-        roisCheck.checked = model.get('rois_visible');
-        roisCheck.addEventListener('change', () => {
-            model.set('rois_visible', roisCheck.checked);
-            model.save_changes();
-        });
-        roisToggle.appendChild(roisCheck);
-        roisToggle.appendChild(document.createTextNode(' ROIs'));
-
-        // Opacity slider
-        const opacityLabel = document.createElement('label');
-        opacityLabel.className = 'opacity-control';
-        opacityLabel.appendChild(document.createTextNode('Opacity: '));
-        const opacitySlider = document.createElement('input');
-        opacitySlider.type = 'range';
-        opacitySlider.min = '0';
-        opacitySlider.max = '1';
-        opacitySlider.step = '0.05';
-        opacitySlider.value = model.get('mask_opacity');
-        opacitySlider.addEventListener('input', () => {
-            model.set('mask_opacity', parseFloat(opacitySlider.value));
-            model.save_changes();
-        });
-        opacityLabel.appendChild(opacitySlider);
-
-        controls.appendChild(imageToggle);
-        controls.appendChild(maskToggle);
-        controls.appendChild(contoursToggle);
-        controls.appendChild(roisToggle);
-        controls.appendChild(opacityLabel);
-
-        // Controls row 2: tools
         const toolbar = document.createElement('div');
         toolbar.className = 'toolbar';
 
-        // Pan tool button
-        const panBtn = document.createElement('button');
-        panBtn.className = 'tool-btn active';
-        panBtn.textContent = 'Pan';
-        panBtn.dataset.mode = 'pan';
+        const toolGroup = document.createElement('div');
+        toolGroup.className = 'tool-group';
 
-        // Draw tool button
-        const drawBtn = document.createElement('button');
-        drawBtn.className = 'tool-btn';
-        drawBtn.textContent = 'Draw ROI';
-        drawBtn.dataset.mode = 'draw';
+        function createToolBtn(icon, mode, title) {
+            const btn = document.createElement('button');
+            btn.className = 'tool-btn' + (model.get('tool_mode') === mode ? ' active' : '');
+            btn.innerHTML = icon;
+            btn.title = title;
+            btn.dataset.mode = mode;
+            return btn;
+        }
 
-        // Reset view button
+        const panBtn = createToolBtn(ICONS.pan, 'pan', 'Pan (P)');
+        const selectBtn = createToolBtn(ICONS.select, 'select', 'Select (V)');
+        const rectBtn = createToolBtn(ICONS.rect, 'draw', 'Rectangle (R)');
+        const polygonBtn = createToolBtn(ICONS.polygon, 'polygon', 'Polygon (G)');
+        const pointBtn = createToolBtn(ICONS.point, 'point', 'Point (O)');
+
+        toolGroup.appendChild(panBtn);
+        toolGroup.appendChild(selectBtn);
+        toolGroup.appendChild(rectBtn);
+        toolGroup.appendChild(polygonBtn);
+        toolGroup.appendChild(pointBtn);
+
+        const sep1 = document.createElement('div');
+        sep1.className = 'toolbar-separator';
+
+        const actionGroup = document.createElement('div');
+        actionGroup.className = 'tool-group';
+
         const resetBtn = document.createElement('button');
         resetBtn.className = 'tool-btn';
-        resetBtn.textContent = 'Reset View';
+        resetBtn.innerHTML = ICONS.reset;
+        resetBtn.title = 'Reset View';
 
-        // Clear ROIs button
-        const clearRoisBtn = document.createElement('button');
-        clearRoisBtn.className = 'tool-btn';
-        clearRoisBtn.textContent = 'Clear ROIs';
+        const clearBtn = document.createElement('button');
+        clearBtn.className = 'tool-btn danger';
+        clearBtn.innerHTML = ICONS.trash;
+        clearBtn.title = 'Clear All Annotations';
 
-        toolbar.appendChild(panBtn);
-        toolbar.appendChild(drawBtn);
-        toolbar.appendChild(resetBtn);
-        toolbar.appendChild(clearRoisBtn);
+        actionGroup.appendChild(resetBtn);
+        actionGroup.appendChild(clearBtn);
 
-        // Canvas wrapper
+        const sep2 = document.createElement('div');
+        sep2.className = 'toolbar-separator';
+
+        const layersGroup = document.createElement('div');
+        layersGroup.className = 'layers-group';
+
+        const layersBtn = document.createElement('button');
+        layersBtn.className = 'layers-btn';
+        layersBtn.innerHTML = ICONS.layers + '<span>Layers</span>';
+
+        const layersDropdown = document.createElement('div');
+        layersDropdown.className = 'layers-dropdown';
+
+        function rebuildLayersDropdown() {
+            layersDropdown.innerHTML = '';
+
+            // Image layer
+            const imageItem = document.createElement('div');
+            imageItem.className = 'layer-item';
+            const imageToggle = document.createElement('button');
+            imageToggle.className = 'layer-toggle' + (model.get('image_visible') ? ' visible' : '');
+            imageToggle.innerHTML = model.get('image_visible') ? ICONS.eye : ICONS.eyeOff;
+            imageToggle.addEventListener('click', () => {
+                model.set('image_visible', !model.get('image_visible'));
+                model.save_changes();
+                imageToggle.classList.toggle('visible', model.get('image_visible'));
+                imageToggle.innerHTML = model.get('image_visible') ? ICONS.eye : ICONS.eyeOff;
+            });
+            const imageLabel = document.createElement('span');
+            imageLabel.textContent = 'Image';
+            imageItem.appendChild(imageToggle);
+            imageItem.appendChild(imageLabel);
+            layersDropdown.appendChild(imageItem);
+
+            // Mask layers section
+            const masks = model.get('_masks_data') || [];
+            if (masks.length > 0) {
+                const maskDivider = document.createElement('div');
+                maskDivider.className = 'layer-divider';
+                layersDropdown.appendChild(maskDivider);
+
+                const maskHeader = document.createElement('div');
+                maskHeader.className = 'layer-header';
+                maskHeader.innerHTML = ICONS.mask + '<span>Masks</span>';
+                layersDropdown.appendChild(maskHeader);
+
+                for (const mask of masks) {
+                    const maskItem = document.createElement('div');
+                    maskItem.className = 'layer-item mask-layer';
+
+                    const maskToggle = document.createElement('button');
+                    maskToggle.className = 'layer-toggle' + (mask.visible ? ' visible' : '');
+                    maskToggle.innerHTML = mask.visible ? ICONS.eye : ICONS.eyeOff;
+                    maskToggle.addEventListener('click', () => {
+                        const updatedMasks = model.get('_masks_data').map(m =>
+                            m.id === mask.id ? { ...m, visible: !m.visible } : m
+                        );
+                        model.set('_masks_data', updatedMasks);
+                        model.save_changes();
+                    });
+
+                    const maskLabel = document.createElement('span');
+                    maskLabel.textContent = mask.name;
+                    maskLabel.className = 'mask-name';
+
+                    const maskColor = document.createElement('input');
+                    maskColor.type = 'color';
+                    maskColor.value = mask.color || '#ff0000';
+                    maskColor.className = 'color-swatch';
+                    maskColor.addEventListener('input', () => {
+                        const updatedMasks = model.get('_masks_data').map(m =>
+                            m.id === mask.id ? { ...m, color: maskColor.value } : m
+                        );
+                        model.set('_masks_data', updatedMasks);
+                        model.save_changes();
+                    });
+
+                    maskItem.appendChild(maskToggle);
+                    maskItem.appendChild(maskLabel);
+                    maskItem.appendChild(maskColor);
+                    layersDropdown.appendChild(maskItem);
+
+                    // Opacity slider for this mask
+                    const opacityItem = document.createElement('div');
+                    opacityItem.className = 'layer-item opacity-item sub-item';
+                    const opacitySlider = document.createElement('input');
+                    opacitySlider.type = 'range';
+                    opacitySlider.min = '0';
+                    opacitySlider.max = '1';
+                    opacitySlider.step = '0.05';
+                    opacitySlider.value = mask.opacity || 0.5;
+                    opacitySlider.addEventListener('input', () => {
+                        const updatedMasks = model.get('_masks_data').map(m =>
+                            m.id === mask.id ? { ...m, opacity: parseFloat(opacitySlider.value) } : m
+                        );
+                        model.set('_masks_data', updatedMasks);
+                        model.save_changes();
+                    });
+                    opacityItem.appendChild(opacitySlider);
+                    layersDropdown.appendChild(opacityItem);
+
+                    // Contours toggle
+                    const contoursItem = document.createElement('div');
+                    contoursItem.className = 'layer-item sub-item';
+                    const contoursCheck = document.createElement('input');
+                    contoursCheck.type = 'checkbox';
+                    contoursCheck.checked = mask.contours || false;
+                    contoursCheck.addEventListener('change', () => {
+                        const updatedMasks = model.get('_masks_data').map(m =>
+                            m.id === mask.id ? { ...m, contours: contoursCheck.checked } : m
+                        );
+                        model.set('_masks_data', updatedMasks);
+                        model.save_changes();
+                    });
+                    const contoursLabel = document.createElement('span');
+                    contoursLabel.textContent = 'Contours only';
+                    contoursItem.appendChild(contoursCheck);
+                    contoursItem.appendChild(contoursLabel);
+                    layersDropdown.appendChild(contoursItem);
+                }
+            }
+
+            // Annotations section
+            const annotDivider = document.createElement('div');
+            annotDivider.className = 'layer-divider';
+            layersDropdown.appendChild(annotDivider);
+
+            const annotHeader = document.createElement('div');
+            annotHeader.className = 'layer-header';
+            annotHeader.textContent = 'Annotations';
+            layersDropdown.appendChild(annotHeader);
+
+            // Rectangles
+            const rectItem = createAnnotationLayerItem('Rectangles', 'rois_visible', 'roi_color');
+            layersDropdown.appendChild(rectItem);
+
+            // Polygons
+            const polyItem = createAnnotationLayerItem('Polygons', 'polygons_visible', 'polygon_color');
+            layersDropdown.appendChild(polyItem);
+
+            // Points
+            const pointItem = createAnnotationLayerItem('Points', 'points_visible', 'point_color');
+            layersDropdown.appendChild(pointItem);
+        }
+
+        function createAnnotationLayerItem(label, visibleProp, colorProp) {
+            const item = document.createElement('div');
+            item.className = 'layer-item';
+
+            const toggle = document.createElement('button');
+            toggle.className = 'layer-toggle' + (model.get(visibleProp) ? ' visible' : '');
+            toggle.innerHTML = model.get(visibleProp) ? ICONS.eye : ICONS.eyeOff;
+            toggle.addEventListener('click', () => {
+                model.set(visibleProp, !model.get(visibleProp));
+                model.save_changes();
+                toggle.classList.toggle('visible', model.get(visibleProp));
+                toggle.innerHTML = model.get(visibleProp) ? ICONS.eye : ICONS.eyeOff;
+            });
+
+            const labelEl = document.createElement('span');
+            labelEl.textContent = label;
+
+            const colorSwatch = document.createElement('input');
+            colorSwatch.type = 'color';
+            colorSwatch.value = model.get(colorProp);
+            colorSwatch.className = 'color-swatch';
+            colorSwatch.addEventListener('input', () => {
+                model.set(colorProp, colorSwatch.value);
+                model.save_changes();
+            });
+
+            item.appendChild(toggle);
+            item.appendChild(labelEl);
+            item.appendChild(colorSwatch);
+            return item;
+        }
+
+        rebuildLayersDropdown();
+
+        layersGroup.appendChild(layersBtn);
+        layersGroup.appendChild(layersDropdown);
+
+        let dropdownOpen = false;
+        layersBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            dropdownOpen = !dropdownOpen;
+            if (dropdownOpen) rebuildLayersDropdown();
+            layersDropdown.classList.toggle('open', dropdownOpen);
+        });
+        document.addEventListener('click', () => {
+            dropdownOpen = false;
+            layersDropdown.classList.remove('open');
+        });
+        layersDropdown.addEventListener('click', (e) => e.stopPropagation());
+
+        toolbar.appendChild(toolGroup);
+        toolbar.appendChild(sep1);
+        toolbar.appendChild(actionGroup);
+        toolbar.appendChild(sep2);
+        toolbar.appendChild(layersGroup);
+
         const canvasWrapper = document.createElement('div');
         canvasWrapper.className = 'canvas-wrapper';
 
@@ -234,17 +372,34 @@ class BioImageViewer(anywidget.AnyWidget):
         const ctx = canvas.getContext('2d');
 
         canvasWrapper.appendChild(canvas);
-        container.appendChild(controls);
+
+        const statusBar = document.createElement('div');
+        statusBar.className = 'status-bar';
+
+        const toolStatus = document.createElement('span');
+        toolStatus.className = 'status-item';
+        toolStatus.textContent = 'Tool: Pan';
+
+        const posStatus = document.createElement('span');
+        posStatus.className = 'status-item';
+        posStatus.textContent = 'Position: --';
+
+        const zoomStatus = document.createElement('span');
+        zoomStatus.className = 'status-item';
+        zoomStatus.textContent = 'Zoom: 100%';
+
+        statusBar.appendChild(toolStatus);
+        statusBar.appendChild(posStatus);
+        statusBar.appendChild(zoomStatus);
+
         container.appendChild(toolbar);
         container.appendChild(canvasWrapper);
+        container.appendChild(statusBar);
         el.appendChild(container);
 
-        // Transform state
         let scale = 1;
         let translateX = 0;
         let translateY = 0;
-
-        // Interaction state
         let isDragging = false;
         let isDrawing = false;
         let lastX = 0;
@@ -252,16 +407,130 @@ class BioImageViewer(anywidget.AnyWidget):
         let drawStartX = 0;
         let drawStartY = 0;
         let currentDrawRect = null;
-
+        let currentPolygonPoints = [];
+        let currentMousePos = null;
         let baseImage = null;
-        let maskCanvasEl = null;
+        let maskCanvases = {};  // Cache for mask canvas elements
 
-        // Coordinate conversion
+        const TOOL_NAMES = {
+            'pan': 'Pan',
+            'select': 'Select',
+            'draw': 'Rectangle',
+            'polygon': 'Polygon',
+            'point': 'Point'
+        };
+
         function screenToImage(screenX, screenY) {
             return {
                 x: (screenX - translateX) / scale,
                 y: (screenY - translateY) / scale
             };
+        }
+
+        function distance(p1, p2) {
+            return Math.sqrt((p1.x - p2.x) ** 2 + (p1.y - p2.y) ** 2);
+        }
+
+        function pointInRect(px, py, rect) {
+            return px >= rect.x && px <= rect.x + rect.width &&
+                   py >= rect.y && py <= rect.y + rect.height;
+        }
+
+        function pointInPolygon(px, py, points) {
+            if (points.length < 3) return false;
+            let inside = false;
+            for (let i = 0, j = points.length - 1; i < points.length; j = i++) {
+                const xi = points[i].x, yi = points[i].y;
+                const xj = points[j].x, yj = points[j].y;
+                if (((yi > py) !== (yj > py)) &&
+                    (px < (xj - xi) * (py - yi) / (yj - yi) + xi)) {
+                    inside = !inside;
+                }
+            }
+            return inside;
+        }
+
+        function pointNearPoint(px, py, point, threshold = 10) {
+            const d = Math.sqrt((px - point.x) ** 2 + (py - point.y) ** 2);
+            return d <= threshold / scale;
+        }
+
+        function findAnnotationAt(imgX, imgY) {
+            if (model.get('points_visible')) {
+                const points = model.get('_points_data') || [];
+                for (const pt of points) {
+                    if (pointNearPoint(imgX, imgY, pt, model.get('point_radius') + 5)) {
+                        return { type: 'point', id: pt.id };
+                    }
+                }
+            }
+            if (model.get('polygons_visible')) {
+                const polygons = model.get('_polygons_data') || [];
+                for (const poly of polygons) {
+                    if (pointInPolygon(imgX, imgY, poly.points)) {
+                        return { type: 'polygon', id: poly.id };
+                    }
+                }
+            }
+            if (model.get('rois_visible')) {
+                const rois = model.get('_rois_data') || [];
+                for (const roi of rois) {
+                    if (pointInRect(imgX, imgY, roi)) {
+                        return { type: 'roi', id: roi.id };
+                    }
+                }
+            }
+            return null;
+        }
+
+        function deleteSelectedAnnotation() {
+            const selectedId = model.get('selected_annotation_id');
+            const selectedType = model.get('selected_annotation_type');
+            if (!selectedId || !selectedType) return;
+
+            if (selectedType === 'roi') {
+                const rois = model.get('_rois_data') || [];
+                model.set('_rois_data', rois.filter(r => r.id !== selectedId));
+            } else if (selectedType === 'polygon') {
+                const polygons = model.get('_polygons_data') || [];
+                model.set('_polygons_data', polygons.filter(p => p.id !== selectedId));
+            } else if (selectedType === 'point') {
+                const points = model.get('_points_data') || [];
+                model.set('_points_data', points.filter(p => p.id !== selectedId));
+            }
+
+            model.set('selected_annotation_id', '');
+            model.set('selected_annotation_type', '');
+            model.save_changes();
+            renderCanvas();
+        }
+
+        async function loadMaskCanvas(mask) {
+            if (!mask.data) return null;
+            const maskImg = await loadImage(mask.data);
+            const maskCanvas = document.createElement('canvas');
+            maskCanvas.width = model.get('width');
+            maskCanvas.height = model.get('height');
+            const maskCtx = maskCanvas.getContext('2d');
+            maskCtx.drawImage(maskImg, 0, 0);
+            return maskCanvas;
+        }
+
+        async function updateMaskCanvases() {
+            const masks = model.get('_masks_data') || [];
+            const newCanvases = {};
+            for (const mask of masks) {
+                if (maskCanvases[mask.id] && maskCanvases[mask.id].dataHash === mask.data) {
+                    newCanvases[mask.id] = maskCanvases[mask.id];
+                } else if (mask.data) {
+                    const canvas = await loadMaskCanvas(mask);
+                    if (canvas) {
+                        newCanvases[mask.id] = { canvas, dataHash: mask.data };
+                    }
+                }
+            }
+            maskCanvases = newCanvases;
+            renderCanvas();
         }
 
         function renderCanvas() {
@@ -273,47 +542,152 @@ class BioImageViewer(anywidget.AnyWidget):
             canvas.width = canvasWrapper.clientWidth || imgWidth;
             canvas.height = canvasWrapper.clientHeight || imgHeight;
 
-            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            const checkSize = 10;
+            ctx.fillStyle = '#2a2a2a';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            ctx.fillStyle = '#3a3a3a';
+            for (let y = 0; y < canvas.height; y += checkSize) {
+                for (let x = 0; x < canvas.width; x += checkSize) {
+                    if ((Math.floor(x / checkSize) + Math.floor(y / checkSize)) % 2 === 0) {
+                        ctx.fillRect(x, y, checkSize, checkSize);
+                    }
+                }
+            }
+
             ctx.save();
             ctx.translate(translateX, translateY);
             ctx.scale(scale, scale);
 
-            // Draw base image
             if (model.get('image_visible') && baseImage) {
                 ctx.drawImage(baseImage, 0, 0);
             }
 
-            // Draw mask overlay
-            if (model.get('mask_visible') && maskCanvasEl) {
-                ctx.globalAlpha = model.get('mask_opacity');
-                ctx.drawImage(maskCanvasEl, 0, 0);
-                ctx.globalAlpha = 1.0;
-            }
-
-            // Draw ROIs
-            if (model.get('rois_visible')) {
-                const rois = model.get('_rois_data') || [];
-                const roiColor = model.get('roi_color');
-                ctx.strokeStyle = roiColor;
-                ctx.lineWidth = 2 / scale;
-                for (const roi of rois) {
-                    ctx.strokeRect(roi.x, roi.y, roi.width, roi.height);
+            // Draw mask overlays
+            const masks = model.get('_masks_data') || [];
+            for (const mask of masks) {
+                if (mask.visible && maskCanvases[mask.id]) {
+                    ctx.globalAlpha = mask.opacity || 0.5;
+                    ctx.drawImage(maskCanvases[mask.id].canvas, 0, 0);
+                    ctx.globalAlpha = 1.0;
                 }
             }
 
-            // Draw current drawing preview
-            if (currentDrawRect && model.get('rois_visible')) {
+            const selectedId = model.get('selected_annotation_id');
+            const selectedType = model.get('selected_annotation_type');
+
+            if (model.get('rois_visible')) {
+                const rois = model.get('_rois_data') || [];
+                const roiColor = model.get('roi_color');
+                for (const roi of rois) {
+                    const isSelected = selectedType === 'roi' && selectedId === roi.id;
+                    ctx.strokeStyle = isSelected ? '#ffffff' : roiColor;
+                    ctx.lineWidth = (isSelected ? 3 : 2) / scale;
+                    ctx.fillStyle = roiColor + '33';
+                    ctx.fillRect(roi.x, roi.y, roi.width, roi.height);
+                    ctx.strokeRect(roi.x, roi.y, roi.width, roi.height);
+                    if (isSelected) {
+                        ctx.setLineDash([5 / scale, 5 / scale]);
+                        ctx.strokeStyle = roiColor;
+                        ctx.strokeRect(roi.x, roi.y, roi.width, roi.height);
+                        ctx.setLineDash([]);
+                    }
+                }
+            }
+
+            if (model.get('polygons_visible')) {
+                const polygons = model.get('_polygons_data') || [];
+                const polyColor = model.get('polygon_color');
+                for (const poly of polygons) {
+                    if (poly.points.length < 2) continue;
+                    const isSelected = selectedType === 'polygon' && selectedId === poly.id;
+                    ctx.beginPath();
+                    ctx.moveTo(poly.points[0].x, poly.points[0].y);
+                    for (let i = 1; i < poly.points.length; i++) {
+                        ctx.lineTo(poly.points[i].x, poly.points[i].y);
+                    }
+                    ctx.closePath();
+                    ctx.fillStyle = polyColor + '33';
+                    ctx.fill();
+                    ctx.strokeStyle = isSelected ? '#ffffff' : polyColor;
+                    ctx.lineWidth = (isSelected ? 3 : 2) / scale;
+                    ctx.stroke();
+                    if (isSelected) {
+                        ctx.setLineDash([5 / scale, 5 / scale]);
+                        ctx.strokeStyle = polyColor;
+                        ctx.stroke();
+                        ctx.setLineDash([]);
+                    }
+                }
+            }
+
+            if (model.get('points_visible')) {
+                const points = model.get('_points_data') || [];
+                const ptColor = model.get('point_color');
+                const ptRadius = model.get('point_radius');
+                for (const pt of points) {
+                    const isSelected = selectedType === 'point' && selectedId === pt.id;
+                    ctx.beginPath();
+                    ctx.arc(pt.x, pt.y, ptRadius / scale, 0, Math.PI * 2);
+                    ctx.fillStyle = ptColor;
+                    ctx.fill();
+                    if (isSelected) {
+                        ctx.strokeStyle = '#ffffff';
+                        ctx.lineWidth = 2 / scale;
+                        ctx.stroke();
+                        ctx.beginPath();
+                        ctx.arc(pt.x, pt.y, (ptRadius + 4) / scale, 0, Math.PI * 2);
+                        ctx.strokeStyle = ptColor;
+                        ctx.setLineDash([3 / scale, 3 / scale]);
+                        ctx.stroke();
+                        ctx.setLineDash([]);
+                    }
+                }
+            }
+
+            if (currentDrawRect) {
                 ctx.strokeStyle = '#00ff00';
                 ctx.lineWidth = 2 / scale;
                 ctx.setLineDash([5 / scale, 5 / scale]);
-                ctx.strokeRect(
-                    currentDrawRect.x, currentDrawRect.y,
-                    currentDrawRect.width, currentDrawRect.height
-                );
+                ctx.strokeRect(currentDrawRect.x, currentDrawRect.y, currentDrawRect.width, currentDrawRect.height);
                 ctx.setLineDash([]);
             }
 
+            if (currentPolygonPoints.length > 0) {
+                ctx.beginPath();
+                ctx.moveTo(currentPolygonPoints[0].x, currentPolygonPoints[0].y);
+                for (let i = 1; i < currentPolygonPoints.length; i++) {
+                    ctx.lineTo(currentPolygonPoints[i].x, currentPolygonPoints[i].y);
+                }
+                if (currentMousePos) {
+                    ctx.lineTo(currentMousePos.x, currentMousePos.y);
+                }
+                ctx.strokeStyle = '#00ff00';
+                ctx.lineWidth = 2 / scale;
+                ctx.setLineDash([5 / scale, 5 / scale]);
+                ctx.stroke();
+                ctx.setLineDash([]);
+
+                for (const pt of currentPolygonPoints) {
+                    ctx.beginPath();
+                    ctx.arc(pt.x, pt.y, 4 / scale, 0, Math.PI * 2);
+                    ctx.fillStyle = '#00ff00';
+                    ctx.fill();
+                }
+
+                if (currentPolygonPoints.length >= 3 && currentMousePos) {
+                    const d = distance(currentMousePos, currentPolygonPoints[0]) * scale;
+                    if (d < 15) {
+                        ctx.beginPath();
+                        ctx.arc(currentPolygonPoints[0].x, currentPolygonPoints[0].y, 8 / scale, 0, Math.PI * 2);
+                        ctx.strokeStyle = '#00ff00';
+                        ctx.lineWidth = 2 / scale;
+                        ctx.stroke();
+                    }
+                }
+            }
+
             ctx.restore();
+            zoomStatus.textContent = 'Zoom: ' + Math.round(scale * 100) + '%';
         }
 
         function resetView() {
@@ -329,24 +703,58 @@ class BioImageViewer(anywidget.AnyWidget):
         }
 
         function updateToolMode(mode) {
+            currentPolygonPoints = [];
+            currentDrawRect = null;
+            currentMousePos = null;
+
             model.set('tool_mode', mode);
             model.save_changes();
-            panBtn.classList.toggle('active', mode === 'pan');
-            drawBtn.classList.toggle('active', mode === 'draw');
-            canvas.style.cursor = mode === 'pan' ? 'grab' : 'crosshair';
+
+            [panBtn, selectBtn, rectBtn, polygonBtn, pointBtn].forEach(btn => {
+                btn.classList.toggle('active', btn.dataset.mode === mode);
+            });
+
+            const cursors = { 'pan': 'grab', 'select': 'default', 'draw': 'crosshair', 'polygon': 'crosshair', 'point': 'crosshair' };
+            canvas.style.cursor = cursors[mode] || 'default';
+            toolStatus.textContent = 'Tool: ' + TOOL_NAMES[mode];
+            renderCanvas();
         }
 
-        // Tool button handlers
         panBtn.addEventListener('click', () => updateToolMode('pan'));
-        drawBtn.addEventListener('click', () => updateToolMode('draw'));
+        selectBtn.addEventListener('click', () => updateToolMode('select'));
+        rectBtn.addEventListener('click', () => updateToolMode('draw'));
+        polygonBtn.addEventListener('click', () => updateToolMode('polygon'));
+        pointBtn.addEventListener('click', () => updateToolMode('point'));
         resetBtn.addEventListener('click', resetView);
-        clearRoisBtn.addEventListener('click', () => {
+        clearBtn.addEventListener('click', () => {
             model.set('_rois_data', []);
+            model.set('_polygons_data', []);
+            model.set('_points_data', []);
+            model.set('selected_annotation_id', '');
+            model.set('selected_annotation_type', '');
             model.save_changes();
             renderCanvas();
         });
 
-        // Zoom with mouse wheel (always active)
+        container.addEventListener('keydown', (e) => {
+            if (e.key === 'p' || e.key === 'P') updateToolMode('pan');
+            else if (e.key === 'v' || e.key === 'V') updateToolMode('select');
+            else if (e.key === 'r' || e.key === 'R') updateToolMode('draw');
+            else if (e.key === 'g' || e.key === 'G') updateToolMode('polygon');
+            else if (e.key === 'o' || e.key === 'O') updateToolMode('point');
+            else if (e.key === 'Escape') {
+                currentPolygonPoints = [];
+                currentDrawRect = null;
+                model.set('selected_annotation_id', '');
+                model.set('selected_annotation_type', '');
+                model.save_changes();
+                renderCanvas();
+            }
+            else if (e.key === 'Delete' || e.key === 'Backspace') {
+                deleteSelectedAnnotation();
+            }
+        });
+
         canvas.addEventListener('wheel', (e) => {
             e.preventDefault();
             const rect = canvas.getBoundingClientRect();
@@ -354,7 +762,7 @@ class BioImageViewer(anywidget.AnyWidget):
             const mouseY = e.clientY - rect.top;
 
             const zoom = e.deltaY < 0 ? 1.1 : 0.9;
-            const newScale = Math.min(Math.max(scale * zoom, 0.1), 20);
+            const newScale = Math.min(Math.max(scale * zoom, 0.1), 50);
 
             translateX = mouseX - (mouseX - translateX) * (newScale / scale);
             translateY = mouseY - (mouseY - translateY) * (newScale / scale);
@@ -363,21 +771,41 @@ class BioImageViewer(anywidget.AnyWidget):
             renderCanvas();
         });
 
-        // Mouse down handler
         canvas.addEventListener('mousedown', (e) => {
             const rect = canvas.getBoundingClientRect();
             const screenX = e.clientX - rect.left;
             const screenY = e.clientY - rect.top;
+            const imgCoords = screenToImage(screenX, screenY);
+            const mode = model.get('tool_mode');
 
-            if (model.get('tool_mode') === 'draw') {
-                // Start drawing ROI
+            if (mode === 'select') {
+                const found = findAnnotationAt(imgCoords.x, imgCoords.y);
+                if (found) {
+                    model.set('selected_annotation_id', found.id);
+                    model.set('selected_annotation_type', found.type);
+                } else {
+                    model.set('selected_annotation_id', '');
+                    model.set('selected_annotation_type', '');
+                }
+                model.save_changes();
+                renderCanvas();
+            } else if (mode === 'draw') {
                 isDrawing = true;
-                const imgCoords = screenToImage(screenX, screenY);
                 drawStartX = imgCoords.x;
                 drawStartY = imgCoords.y;
                 currentDrawRect = { x: drawStartX, y: drawStartY, width: 0, height: 0 };
-            } else {
-                // Start panning
+            } else if (mode === 'point') {
+                const points = model.get('_points_data') || [];
+                const newPoint = {
+                    id: 'pt_' + Date.now(),
+                    x: Math.round(imgCoords.x),
+                    y: Math.round(imgCoords.y)
+                };
+                points.push(newPoint);
+                model.set('_points_data', [...points]);
+                model.save_changes();
+                renderCanvas();
+            } else if (mode === 'pan') {
                 isDragging = true;
                 lastX = e.clientX;
                 lastY = e.clientY;
@@ -385,7 +813,71 @@ class BioImageViewer(anywidget.AnyWidget):
             }
         });
 
-        // Mouse move handler
+        canvas.addEventListener('click', (e) => {
+            if (model.get('tool_mode') !== 'polygon') return;
+
+            const rect = canvas.getBoundingClientRect();
+            const screenX = e.clientX - rect.left;
+            const screenY = e.clientY - rect.top;
+            const imgCoords = screenToImage(screenX, screenY);
+
+            if (currentPolygonPoints.length >= 3) {
+                const d = distance(imgCoords, currentPolygonPoints[0]) * scale;
+                if (d < 15) {
+                    const polygons = model.get('_polygons_data') || [];
+                    const newPoly = {
+                        id: 'poly_' + Date.now(),
+                        points: currentPolygonPoints.map(p => ({ x: Math.round(p.x), y: Math.round(p.y) }))
+                    };
+                    polygons.push(newPoly);
+                    model.set('_polygons_data', [...polygons]);
+                    model.save_changes();
+                    currentPolygonPoints = [];
+                    renderCanvas();
+                    return;
+                }
+            }
+
+            currentPolygonPoints.push({ x: imgCoords.x, y: imgCoords.y });
+            renderCanvas();
+        });
+
+        canvas.addEventListener('dblclick', (e) => {
+            if (model.get('tool_mode') !== 'polygon') return;
+            if (currentPolygonPoints.length < 3) return;
+
+            const polygons = model.get('_polygons_data') || [];
+            const newPoly = {
+                id: 'poly_' + Date.now(),
+                points: currentPolygonPoints.map(p => ({ x: Math.round(p.x), y: Math.round(p.y) }))
+            };
+            polygons.push(newPoly);
+            model.set('_polygons_data', [...polygons]);
+            model.save_changes();
+            currentPolygonPoints = [];
+            renderCanvas();
+        });
+
+        canvas.addEventListener('mousemove', (e) => {
+            const rect = canvas.getBoundingClientRect();
+            const screenX = e.clientX - rect.left;
+            const screenY = e.clientY - rect.top;
+            const imgCoords = screenToImage(screenX, screenY);
+
+            const imgWidth = model.get('width');
+            const imgHeight = model.get('height');
+            if (imgCoords.x >= 0 && imgCoords.x < imgWidth && imgCoords.y >= 0 && imgCoords.y < imgHeight) {
+                posStatus.textContent = 'Position: (' + Math.round(imgCoords.x) + ', ' + Math.round(imgCoords.y) + ')';
+            } else {
+                posStatus.textContent = 'Position: --';
+            }
+
+            if (model.get('tool_mode') === 'polygon' && currentPolygonPoints.length > 0) {
+                currentMousePos = imgCoords;
+                renderCanvas();
+            }
+        });
+
         window.addEventListener('mousemove', (e) => {
             const rect = canvas.getBoundingClientRect();
             const screenX = e.clientX - rect.left;
@@ -409,10 +901,8 @@ class BioImageViewer(anywidget.AnyWidget):
             }
         });
 
-        // Mouse up handler
         window.addEventListener('mouseup', () => {
             if (isDrawing && currentDrawRect) {
-                // Finalize ROI if it has reasonable size
                 if (currentDrawRect.width > 5 && currentDrawRect.height > 5) {
                     const rois = model.get('_rois_data') || [];
                     const newRoi = {
@@ -439,8 +929,10 @@ class BioImageViewer(anywidget.AnyWidget):
             }
         });
 
-        // Set initial cursor
-        canvas.style.cursor = model.get('tool_mode') === 'pan' ? 'grab' : 'crosshair';
+        const initMode = model.get('tool_mode');
+        const cursors = { 'pan': 'grab', 'select': 'default', 'draw': 'crosshair', 'polygon': 'crosshair', 'point': 'crosshair' };
+        canvas.style.cursor = cursors[initMode] || 'default';
+        toolStatus.textContent = 'Tool: ' + TOOL_NAMES[initMode];
 
         async function loadBaseImage() {
             const imageData = model.get('image_data');
@@ -450,44 +942,31 @@ class BioImageViewer(anywidget.AnyWidget):
             resetView();
         }
 
-        async function loadMaskImage() {
-            const maskData = model.get('mask_data');
-            const imgWidth = model.get('width');
-            const imgHeight = model.get('height');
-
-            if (!maskData || imgWidth === 0 || imgHeight === 0) return;
-
-            const maskImg = await loadImage(maskData);
-
-            maskCanvasEl = document.createElement('canvas');
-            maskCanvasEl.width = imgWidth;
-            maskCanvasEl.height = imgHeight;
-            const maskCtx = maskCanvasEl.getContext('2d');
-            maskCtx.drawImage(maskImg, 0, 0);
-            renderCanvas();
-        }
-
         await loadBaseImage();
-        await loadMaskImage();
+        await updateMaskCanvases();
 
         model.on('change:image_data', loadBaseImage);
-        model.on('change:mask_data', loadMaskImage);
+        model.on('change:_masks_data', updateMaskCanvases);
         model.on('change:image_visible', renderCanvas);
-        model.on('change:mask_visible', renderCanvas);
         model.on('change:rois_visible', renderCanvas);
-        model.on('change:mask_opacity', renderCanvas);
-        model.on('change:show_contours', () => {
-            contoursCheck.checked = model.get('show_contours');
-        });
+        model.on('change:polygons_visible', renderCanvas);
+        model.on('change:points_visible', renderCanvas);
         model.on('change:_rois_data', renderCanvas);
+        model.on('change:_polygons_data', renderCanvas);
+        model.on('change:_points_data', renderCanvas);
         model.on('change:roi_color', renderCanvas);
+        model.on('change:polygon_color', renderCanvas);
+        model.on('change:point_color', renderCanvas);
         model.on('change:width', resetView);
         model.on('change:height', resetView);
         model.on('change:tool_mode', () => {
             const mode = model.get('tool_mode');
-            panBtn.classList.toggle('active', mode === 'pan');
-            drawBtn.classList.toggle('active', mode === 'draw');
-            canvas.style.cursor = mode === 'pan' ? 'grab' : 'crosshair';
+            [panBtn, selectBtn, rectBtn, polygonBtn, pointBtn].forEach(btn => {
+                btn.classList.toggle('active', btn.dataset.mode === mode);
+            });
+            const cursors = { 'pan': 'grab', 'select': 'default', 'draw': 'crosshair', 'polygon': 'crosshair', 'point': 'crosshair' };
+            canvas.style.cursor = cursors[mode] || 'default';
+            toolStatus.textContent = 'Tool: ' + TOOL_NAMES[mode];
         });
 
         new ResizeObserver(() => renderCanvas()).observe(canvasWrapper);
@@ -498,99 +977,475 @@ class BioImageViewer(anywidget.AnyWidget):
 
     _css = """
     .bioimage-viewer {
-        font-family: system-ui, -apple-system, sans-serif;
-        padding: 8px;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        background: #f8f9fa;
+        border-radius: 8px;
+        overflow: hidden;
+        outline: none;
     }
-    .controls, .toolbar {
-        display: flex;
-        gap: 12px;
-        margin-bottom: 8px;
-        align-items: center;
-        flex-wrap: wrap;
+    .bioimage-viewer:focus {
+        box-shadow: 0 0 0 2px #0d6efd33;
     }
-    .toggle {
-        display: flex;
-        align-items: center;
-        gap: 4px;
-        cursor: pointer;
-    }
-    .opacity-control {
+    .toolbar {
         display: flex;
         align-items: center;
         gap: 8px;
+        padding: 8px 12px;
+        background: #ffffff;
+        border-bottom: 1px solid #e0e0e0;
     }
-    .opacity-control input[type="range"] {
-        width: 100px;
+    .tool-group {
+        display: flex;
+        gap: 2px;
+    }
+    .toolbar-separator {
+        width: 1px;
+        height: 24px;
+        background: #e0e0e0;
+        margin: 0 4px;
     }
     .tool-btn {
-        padding: 4px 10px;
-        border: 1px solid #ccc;
-        border-radius: 4px;
-        background: #f5f5f5;
+        width: 32px;
+        height: 32px;
+        padding: 6px;
+        border: none;
+        border-radius: 6px;
+        background: transparent;
+        color: #555;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        transition: all 0.15s ease;
+    }
+    .tool-btn:hover {
+        background: #f0f0f0;
+        color: #333;
+    }
+    .tool-btn.active {
+        background: #0d6efd;
+        color: white;
+    }
+    .tool-btn.danger:hover {
+        background: #dc3545;
+        color: white;
+    }
+    .tool-btn svg {
+        width: 18px;
+        height: 18px;
+    }
+    .layers-group {
+        position: relative;
+        margin-left: auto;
+    }
+    .layers-btn {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 6px 12px;
+        border: 1px solid #e0e0e0;
+        border-radius: 6px;
+        background: #fff;
+        color: #555;
         cursor: pointer;
         font-size: 13px;
     }
-    .tool-btn:hover {
-        background: #e8e8e8;
+    .layers-btn:hover {
+        background: #f8f8f8;
     }
-    .tool-btn.active {
-        background: #0066cc;
-        color: white;
-        border-color: #0066cc;
+    .layers-btn svg {
+        width: 16px;
+        height: 16px;
+    }
+    .layers-dropdown {
+        position: absolute;
+        top: 100%;
+        right: 0;
+        margin-top: 4px;
+        min-width: 220px;
+        max-height: 400px;
+        overflow-y: auto;
+        background: #fff;
+        border: 1px solid #e0e0e0;
+        border-radius: 8px;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+        padding: 8px 0;
+        display: none;
+        z-index: 100;
+    }
+    .layers-dropdown.open {
+        display: block;
+    }
+    .layer-header {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 6px 12px;
+        font-size: 11px;
+        font-weight: 600;
+        color: #666;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+    }
+    .layer-header svg {
+        width: 14px;
+        height: 14px;
+    }
+    .layer-item {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 12px;
+        font-size: 13px;
+        color: #333;
+    }
+    .layer-item:hover {
+        background: #f8f9fa;
+    }
+    .layer-item.sub-item {
+        padding-left: 44px;
+        padding-top: 4px;
+        padding-bottom: 4px;
+    }
+    .layer-item.mask-layer {
+        background: #f8f9fa;
+    }
+    .mask-name {
+        flex: 1;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+    .layer-toggle {
+        width: 24px;
+        height: 24px;
+        padding: 4px;
+        border: none;
+        border-radius: 4px;
+        background: transparent;
+        color: #999;
+        cursor: pointer;
+    }
+    .layer-toggle.visible {
+        color: #0d6efd;
+    }
+    .layer-toggle svg {
+        width: 16px;
+        height: 16px;
+    }
+    .layer-divider {
+        height: 1px;
+        background: #e0e0e0;
+        margin: 8px 0;
+    }
+    .color-swatch {
+        width: 24px;
+        height: 24px;
+        padding: 0;
+        border: 1px solid #ccc;
+        border-radius: 4px;
+        cursor: pointer;
+        flex-shrink: 0;
+    }
+    .opacity-item {
+        flex-direction: column;
+        align-items: stretch;
+        gap: 4px;
+    }
+    .opacity-item input[type="range"] {
+        width: 100%;
+        height: 4px;
+        border-radius: 2px;
+        -webkit-appearance: none;
+        background: #e0e0e0;
+    }
+    .opacity-item input[type="range"]::-webkit-slider-thumb {
+        -webkit-appearance: none;
+        width: 14px;
+        height: 14px;
+        border-radius: 50%;
+        background: #0d6efd;
+        cursor: pointer;
     }
     .canvas-wrapper {
-        border: 1px solid #ccc;
-        overflow: hidden;
+        position: relative;
         width: 100%;
         height: 500px;
-        position: relative;
+        overflow: hidden;
     }
     .viewer-canvas {
         display: block;
     }
+    .status-bar {
+        display: flex;
+        gap: 24px;
+        padding: 6px 12px;
+        background: #f0f0f0;
+        border-top: 1px solid #e0e0e0;
+        font-size: 12px;
+        color: #666;
+    }
+    .status-item {
+        white-space: nowrap;
+    }
+
     @media (prefers-color-scheme: dark) {
         .bioimage-viewer {
-            color: #e0e0e0;
+            background: #1e1e1e;
         }
-        .canvas-wrapper {
-            border-color: #444;
+        .toolbar {
+            background: #2d2d2d;
+            border-color: #404040;
+        }
+        .toolbar-separator {
+            background: #404040;
         }
         .tool-btn {
-            background: #333;
-            border-color: #555;
-            color: #e0e0e0;
+            color: #aaa;
         }
         .tool-btn:hover {
-            background: #444;
+            background: #3d3d3d;
+            color: #fff;
         }
         .tool-btn.active {
-            background: #0066cc;
-            border-color: #0066cc;
+            background: #0d6efd;
             color: white;
+        }
+        .layers-btn {
+            background: #2d2d2d;
+            border-color: #404040;
+            color: #aaa;
+        }
+        .layers-btn:hover {
+            background: #3d3d3d;
+        }
+        .layers-dropdown {
+            background: #2d2d2d;
+            border-color: #404040;
+        }
+        .layer-header {
+            color: #888;
+        }
+        .layer-item {
+            color: #e0e0e0;
+        }
+        .layer-item:hover {
+            background: #3d3d3d;
+        }
+        .layer-item.mask-layer {
+            background: #353535;
+        }
+        .layer-toggle {
+            color: #666;
+        }
+        .layer-toggle.visible {
+            color: #0d6efd;
+        }
+        .layer-divider {
+            background: #404040;
+        }
+        .status-bar {
+            background: #252525;
+            border-color: #404040;
+            color: #888;
+        }
+        .opacity-item input[type="range"] {
+            background: #404040;
         }
     }
     """
 
-    # Image data as base64 encoded PNG
+    # Image data
     image_data = traitlets.Unicode("").tag(sync=True)
-    mask_data = traitlets.Unicode("").tag(sync=True)
+
+    # Multiple mask layers: [{id, name, data, visible, opacity, color, contours}]
+    _masks_data = traitlets.List(traitlets.Dict()).tag(sync=True)
 
     # Layer controls
     image_visible = traitlets.Bool(True).tag(sync=True)
-    mask_visible = traitlets.Bool(True).tag(sync=True)
-    mask_opacity = traitlets.Float(0.5).tag(sync=True)
-    show_contours = traitlets.Bool(False).tag(sync=True)
-    contour_width = traitlets.Int(1).tag(sync=True)
 
     # Image dimensions
     width = traitlets.Int(0).tag(sync=True)
     height = traitlets.Int(0).tag(sync=True)
 
-    # ROI annotation
-    tool_mode = traitlets.Unicode("pan").tag(sync=True)  # 'pan' or 'draw'
+    # Tool mode
+    tool_mode = traitlets.Unicode("pan").tag(sync=True)
+
+    # Annotations
     _rois_data = traitlets.List(traitlets.Dict()).tag(sync=True)
     rois_visible = traitlets.Bool(True).tag(sync=True)
     roi_color = traitlets.Unicode("#ff0000").tag(sync=True)
+
+    _polygons_data = traitlets.List(traitlets.Dict()).tag(sync=True)
+    polygons_visible = traitlets.Bool(True).tag(sync=True)
+    polygon_color = traitlets.Unicode("#00ff00").tag(sync=True)
+
+    _points_data = traitlets.List(traitlets.Dict()).tag(sync=True)
+    points_visible = traitlets.Bool(True).tag(sync=True)
+    point_color = traitlets.Unicode("#0066ff").tag(sync=True)
+    point_radius = traitlets.Int(5).tag(sync=True)
+
+    # Selection
+    selected_annotation_id = traitlets.Unicode("").tag(sync=True)
+    selected_annotation_type = traitlets.Unicode("").tag(sync=True)
+
+    def set_image(self, data: np.ndarray):
+        """Set the base image from a numpy array."""
+        if data.ndim > 2:
+            data = data.squeeze()
+            if data.ndim > 2:
+                data = data[0] if data.ndim == 3 else data[0, 0]
+
+        self.height, self.width = data.shape[:2]
+        normalized = _normalize_image(data)
+        self.image_data = _array_to_base64(normalized)
+
+    def add_mask(
+        self,
+        labels: np.ndarray,
+        name: str | None = None,
+        color: str | None = None,
+        opacity: float = 0.5,
+        visible: bool = True,
+        contours_only: bool = False,
+        contour_width: int = 1,
+    ) -> str:
+        """Add a mask layer.
+
+        Args:
+            labels: 2D numpy array of label values
+            name: Display name for the mask layer
+            color: Hex color for the mask (auto-assigned if None)
+            opacity: Opacity value 0-1
+            visible: Whether the mask is visible
+            contours_only: If True, show only contours
+            contour_width: Width of contours in pixels
+
+        Returns:
+            The mask ID
+        """
+        if labels.ndim > 2:
+            labels = labels.squeeze()
+            if labels.ndim > 2:
+                labels = labels[0] if labels.ndim == 3 else labels[0, 0]
+
+        mask_id = f"mask_{len(self._masks_data)}_{id(labels)}"
+
+        # Store raw labels
+        self._mask_arrays[mask_id] = labels
+
+        # Auto-assign color
+        if color is None:
+            color = MASK_COLORS[len(self._masks_data) % len(MASK_COLORS)]
+
+        # Auto-assign name
+        if name is None:
+            name = f"Mask {len(self._masks_data) + 1}"
+
+        # Generate RGBA
+        rgba = _labels_to_rgba(labels, contours_only=contours_only, contour_width=contour_width)
+        data_b64 = _array_to_base64(rgba)
+
+        # Cache
+        self._mask_caches[mask_id] = {
+            (contours_only, contour_width): data_b64
+        }
+
+        mask_entry = {
+            "id": mask_id,
+            "name": name,
+            "data": data_b64,
+            "visible": visible,
+            "opacity": opacity,
+            "color": color,
+            "contours": contours_only,
+            "contour_width": contour_width,
+        }
+
+        self._masks_data = [*self._masks_data, mask_entry]
+        return mask_id
+
+    def set_mask(
+        self,
+        labels: np.ndarray,
+        name: str | None = None,
+        contours_only: bool = False,
+        contour_width: int = 1,
+    ):
+        """Set a single mask (convenience method, clears existing masks).
+
+        For backward compatibility with single-mask API.
+        """
+        self._masks_data = []
+        self._mask_arrays = {}
+        self._mask_caches = {}
+        self.add_mask(labels, name=name or "Mask", contours_only=contours_only, contour_width=contour_width)
+
+    def remove_mask(self, mask_id: str):
+        """Remove a mask layer by ID."""
+        self._masks_data = [m for m in self._masks_data if m["id"] != mask_id]
+        if mask_id in self._mask_arrays:
+            del self._mask_arrays[mask_id]
+        if mask_id in self._mask_caches:
+            del self._mask_caches[mask_id]
+
+    def clear_masks(self):
+        """Remove all mask layers."""
+        self._masks_data = []
+        self._mask_arrays = {}
+        self._mask_caches = {}
+
+    def update_mask_settings(self, mask_id: str, **kwargs):
+        """Update settings for a mask layer.
+
+        Args:
+            mask_id: The mask ID to update
+            **kwargs: Settings to update (name, color, opacity, visible, contours, contour_width)
+        """
+        updated = []
+        for mask in self._masks_data:
+            if mask["id"] == mask_id:
+                new_mask = {**mask, **kwargs}
+
+                # Regenerate if contour settings changed
+                if "contours" in kwargs or "contour_width" in kwargs:
+                    if mask_id in self._mask_arrays:
+                        contours = new_mask.get("contours", False)
+                        width = new_mask.get("contour_width", 1)
+                        cache_key = (contours, width)
+
+                        if mask_id in self._mask_caches and cache_key in self._mask_caches[mask_id]:
+                            new_mask["data"] = self._mask_caches[mask_id][cache_key]
+                        else:
+                            rgba = _labels_to_rgba(
+                                self._mask_arrays[mask_id],
+                                contours_only=contours,
+                                contour_width=width
+                            )
+                            data_b64 = _array_to_base64(rgba)
+                            if mask_id not in self._mask_caches:
+                                self._mask_caches[mask_id] = {}
+                            self._mask_caches[mask_id][cache_key] = data_b64
+                            new_mask["data"] = data_b64
+
+                updated.append(new_mask)
+            else:
+                updated.append(mask)
+        self._masks_data = updated
+
+    def get_mask_ids(self) -> list[str]:
+        """Get list of all mask IDs."""
+        return [m["id"] for m in self._masks_data]
+
+    @property
+    def masks_df(self) -> pd.DataFrame:
+        """Get mask layers as a pandas DataFrame."""
+        if not self._masks_data:
+            return pd.DataFrame(columns=["id", "name", "visible", "opacity", "color", "contours"])
+        return pd.DataFrame([
+            {k: v for k, v in m.items() if k != "data"}
+            for m in self._masks_data
+        ])
 
     @property
     def rois_df(self) -> pd.DataFrame:
@@ -601,94 +1456,54 @@ class BioImageViewer(anywidget.AnyWidget):
 
     @rois_df.setter
     def rois_df(self, df: pd.DataFrame):
-        """Set ROIs from a pandas DataFrame."""
         self._rois_data = df.to_dict("records")
 
+    @property
+    def polygons_df(self) -> pd.DataFrame:
+        """Get polygons as a pandas DataFrame."""
+        if not self._polygons_data:
+            return pd.DataFrame(columns=["id", "points", "num_vertices"])
+        data = []
+        for poly in self._polygons_data:
+            data.append({
+                "id": poly["id"],
+                "points": poly["points"],
+                "num_vertices": len(poly["points"])
+            })
+        return pd.DataFrame(data)
+
+    @polygons_df.setter
+    def polygons_df(self, df: pd.DataFrame):
+        records = df.to_dict("records")
+        self._polygons_data = [{"id": r["id"], "points": r["points"]} for r in records]
+
+    @property
+    def points_df(self) -> pd.DataFrame:
+        """Get points as a pandas DataFrame."""
+        if not self._points_data:
+            return pd.DataFrame(columns=["id", "x", "y"])
+        return pd.DataFrame(self._points_data)
+
+    @points_df.setter
+    def points_df(self, df: pd.DataFrame):
+        self._points_data = df.to_dict("records")
+
     def clear_rois(self):
-        """Clear all ROIs."""
+        """Clear all rectangle ROIs."""
         self._rois_data = []
 
-    def set_image(self, data: np.ndarray):
-        """Set the base image from a numpy array."""
-        if data.ndim > 2:
-            # Take first 2D slice if multi-dimensional
-            data = data.squeeze()
-            if data.ndim > 2:
-                data = data[0] if data.ndim == 3 else data[0, 0]
+    def clear_polygons(self):
+        """Clear all polygons."""
+        self._polygons_data = []
 
-        self.height, self.width = data.shape[:2]
-        normalized = _normalize_image(data)
-        self.image_data = _array_to_base64(normalized)
+    def clear_points(self):
+        """Clear all points."""
+        self._points_data = []
 
-    def set_mask(
-        self,
-        labels: np.ndarray,
-        contours_only: bool | None = None,
-        contour_width: int | None = None,
-    ):
-        """Set the label mask from a numpy array.
-
-        Args:
-            labels: 2D numpy array of label values
-            contours_only: If True, show only contours. If None, uses self.show_contours
-            contour_width: Width of contours in pixels. If None, uses self.contour_width
-        """
-        if labels.ndim > 2:
-            labels = labels.squeeze()
-            if labels.ndim > 2:
-                labels = labels[0] if labels.ndim == 3 else labels[0, 0]
-
-        # Store original labels for later regeneration
-        self._labels_array = labels
-
-        # Clear cache when new labels are set
-        self._mask_cache = {}
-
-        # Use instance attributes if not specified
-        use_contours = (
-            contours_only if contours_only is not None else self.show_contours
-        )
-        use_width = contour_width if contour_width is not None else self.contour_width
-
-        # Generate the requested version immediately for instant display
-        current_key = (use_contours, use_width)
-        rgba_current = _labels_to_rgba(
-            labels, contours_only=use_contours, contour_width=use_width
-        )
-        self._mask_cache[current_key] = _array_to_base64(rgba_current)
-        self.mask_data = self._mask_cache[current_key]
-
-        # Pre-generate the other version asynchronously in background
-        import threading
-
-        other_key = (not use_contours, use_width)
-
-        def _pregenerate_other():
-            rgba_other = _labels_to_rgba(
-                labels, contours_only=not use_contours, contour_width=use_width
-            )
-            self._mask_cache[other_key] = _array_to_base64(rgba_other)
-
-        # Start background thread to pre-generate the alternate version
-        thread = threading.Thread(target=_pregenerate_other, daemon=True)
-        thread.start()
-
-    def _regenerate_mask(self):
-        """Regenerate mask from cached or stored labels array."""
-        if self._labels_array is None:
-            return
-
-        cache_key = (self.show_contours, self.contour_width)
-
-        # Check if we have it cached
-        if cache_key in self._mask_cache:
-            self.mask_data = self._mask_cache[cache_key]
-        else:
-            # Generate and cache if not available
-            rgba = _labels_to_rgba(
-                self._labels_array,
-                contours_only=self.show_contours,
-                contour_width=self.contour_width,
-            )
-            self._mask_cache[cache_key] = _array_to_base64(rgba)
-            self.mask_data = self._mask_cache[cache_key]
+    def clear_all_annotations(self):
+        """Clear all annotations."""
+        self._rois_data = []
+        self._polygons_data = []
+        self._points_data = []
+        self.selected_annotation_id = ""
+        self.selected_annotation_type = ""
