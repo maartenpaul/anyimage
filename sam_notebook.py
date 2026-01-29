@@ -16,7 +16,24 @@ def _():
 
 @app.cell
 def _(BioImage, bioio_tifffile):
-    img = BioImage("image.tif", reader=bioio_tifffile.Reader)
+    img2 = BioImage("/var/home/maartenpaul/Nextcloud2/LACDR_NL-Bioimaging (Projectfolder)/Maarten Paul/Projects/vanDijkBrechtje_PBMC_AI_classification/Experimental data/Brechje/20251124_BvD003_D3/p1/tiffs/20251124_172329_075/wellxy001c5t1.tif", reader=bioio_tifffile.Reader)
+    return
+
+
+@app.cell
+def _(mo):
+    # Create a file browser  
+    file_browser = mo.ui.file_browser(multiple=False,filetypes=[".tif", ".tiff"],label="Select a TIFF image",initial_path="/var/home/maartenpaul/Nextcloud2/LACDR_NL-Bioimaging (Projectfolder)/Maarten Paul/Projects/vanDijkBrechtje_PBMC_AI_classification/Experimental data/Brechje/")  
+  
+    # Display it  
+    file_browser  
+
+    return (file_browser,)
+
+
+@app.cell
+def _(BioImage, bioio_tifffile, file_browser):
+    img = BioImage(file_browser.path(), reader=bioio_tifffile.Reader)
     return (img,)
 
 
@@ -31,7 +48,7 @@ def _(BioImageViewer, img, mo):
 
     widget = mo.ui.anywidget(viewer)
     widget
-    return viewer, widget
+    return (widget,)
 
 
 @app.cell

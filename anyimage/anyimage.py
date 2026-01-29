@@ -113,7 +113,8 @@ class BioImageViewer(anywidget.AnyWidget):
         eye: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>',
         eyeOff: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>',
         layers: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>',
-        mask: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M9 21V9"/></svg>'
+        mask: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M9 21V9"/></svg>',
+        download: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>'
     };
 
     async function render({ model, el }) {
@@ -180,6 +181,35 @@ class BioImageViewer(anywidget.AnyWidget):
         const layersDropdown = document.createElement('div');
         layersDropdown.className = 'layers-dropdown';
 
+        function downloadMask(mask) {
+            if (!mask.data) return;
+            
+            // Create a temporary canvas to render the mask
+            const tempCanvas = document.createElement('canvas');
+            tempCanvas.width = model.get('width');
+            tempCanvas.height = model.get('height');
+            const tempCtx = tempCanvas.getContext('2d');
+            
+            // Load and draw the mask image
+            const maskImg = new Image();
+            maskImg.onload = () => {
+                tempCtx.drawImage(maskImg, 0, 0);
+                
+                // Convert canvas to blob and download
+                tempCanvas.toBlob((blob) => {
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = `${mask.name.replace(/\s+/g, '_')}.png`;
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    URL.revokeObjectURL(url);
+                }, 'image/png');
+            };
+            maskImg.src = 'data:image/png;base64,' + mask.data;
+        }
+
         function rebuildLayersDropdown() {
             layersDropdown.innerHTML = '';
 
@@ -200,6 +230,48 @@ class BioImageViewer(anywidget.AnyWidget):
             imageItem.appendChild(imageToggle);
             imageItem.appendChild(imageLabel);
             layersDropdown.appendChild(imageItem);
+
+            // Brightness slider
+            const brightnessItem = document.createElement('div');
+            brightnessItem.className = 'layer-item sub-item slider-item';
+            const brightnessLabel = document.createElement('span');
+            brightnessLabel.className = 'slider-label';
+            brightnessLabel.textContent = 'Brightness';
+            const brightnessSlider = document.createElement('input');
+            brightnessSlider.type = 'range';
+            brightnessSlider.min = '-1';
+            brightnessSlider.max = '1';
+            brightnessSlider.step = '0.05';
+            brightnessSlider.value = model.get('image_brightness') || 0;
+            brightnessSlider.className = 'adjustment-slider';
+            brightnessSlider.addEventListener('input', () => {
+                model.set('image_brightness', parseFloat(brightnessSlider.value));
+                model.save_changes();
+            });
+            brightnessItem.appendChild(brightnessLabel);
+            brightnessItem.appendChild(brightnessSlider);
+            layersDropdown.appendChild(brightnessItem);
+
+            // Contrast slider
+            const contrastItem = document.createElement('div');
+            contrastItem.className = 'layer-item sub-item slider-item';
+            const contrastLabel = document.createElement('span');
+            contrastLabel.className = 'slider-label';
+            contrastLabel.textContent = 'Contrast';
+            const contrastSlider = document.createElement('input');
+            contrastSlider.type = 'range';
+            contrastSlider.min = '-1';
+            contrastSlider.max = '1';
+            contrastSlider.step = '0.05';
+            contrastSlider.value = model.get('image_contrast') || 0;
+            contrastSlider.className = 'adjustment-slider';
+            contrastSlider.addEventListener('input', () => {
+                model.set('image_contrast', parseFloat(contrastSlider.value));
+                model.save_changes();
+            });
+            contrastItem.appendChild(contrastLabel);
+            contrastItem.appendChild(contrastSlider);
+            layersDropdown.appendChild(contrastItem);
 
             // Mask layers section
             const masks = model.get('_masks_data') || [];
@@ -232,6 +304,17 @@ class BioImageViewer(anywidget.AnyWidget):
                     maskLabel.textContent = mask.name;
                     maskLabel.className = 'mask-name';
 
+                    const maskActions = document.createElement('div');
+                    maskActions.className = 'mask-actions';
+
+                    const downloadBtn = document.createElement('button');
+                    downloadBtn.className = 'layer-action-btn';
+                    downloadBtn.innerHTML = ICONS.download;
+                    downloadBtn.title = 'Download mask';
+                    downloadBtn.addEventListener('click', () => {
+                        downloadMask(mask);
+                    });
+
                     const maskColor = document.createElement('input');
                     maskColor.type = 'color';
                     maskColor.value = mask.color || '#ff0000';
@@ -244,9 +327,12 @@ class BioImageViewer(anywidget.AnyWidget):
                         model.save_changes();
                     });
 
+                    maskActions.appendChild(downloadBtn);
+                    maskActions.appendChild(maskColor);
+
                     maskItem.appendChild(maskToggle);
                     maskItem.appendChild(maskLabel);
-                    maskItem.appendChild(maskColor);
+                    maskItem.appendChild(maskActions);
                     layersDropdown.appendChild(maskItem);
 
                     // Opacity slider for this mask
@@ -564,7 +650,18 @@ class BioImageViewer(anywidget.AnyWidget):
             ctx.scale(scale, scale);
 
             if (model.get('image_visible') && baseImage) {
+                const brightness = model.get('image_brightness') || 0;
+                const contrast = model.get('image_contrast') || 0;
+                
+                // Apply brightness and contrast filters
+                const brightnessPercent = (brightness * 100);
+                const contrastPercent = ((contrast + 1) * 100);
+                ctx.filter = `brightness(${100 + brightnessPercent}%) contrast(${contrastPercent}%)`;
+                
                 ctx.drawImage(baseImage, 0, 0);
+                
+                // Reset filter
+                ctx.filter = 'none';
             }
 
             // Draw mask overlays
@@ -966,6 +1063,8 @@ class BioImageViewer(anywidget.AnyWidget):
         model.on('change:image_data', loadBaseImage);
         model.on('change:_masks_data', updateMaskCanvases);
         model.on('change:image_visible', renderCanvas);
+        model.on('change:image_brightness', renderCanvas);
+        model.on('change:image_contrast', renderCanvas);
         model.on('change:rois_visible', renderCanvas);
         model.on('change:polygons_visible', renderCanvas);
         model.on('change:points_visible', renderCanvas);
@@ -1134,6 +1233,33 @@ class BioImageViewer(anywidget.AnyWidget):
         text-overflow: ellipsis;
         white-space: nowrap;
     }
+    .mask-actions {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+    }
+    .layer-action-btn {
+        width: 24px;
+        height: 24px;
+        padding: 4px;
+        border: none;
+        border-radius: 4px;
+        background: transparent;
+        color: #666;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        transition: all 0.15s ease;
+    }
+    .layer-action-btn:hover {
+        background: #e0e0e0;
+        color: #333;
+    }
+    .layer-action-btn svg {
+        width: 14px;
+        height: 14px;
+    }
     .layer-toggle {
         width: 24px;
         height: 24px;
@@ -1184,6 +1310,39 @@ class BioImageViewer(anywidget.AnyWidget):
         border-radius: 50%;
         background: #0d6efd;
         cursor: pointer;
+    }
+    .slider-item {
+        flex-direction: column;
+        align-items: stretch;
+        gap: 6px;
+    }
+    .slider-label {
+        font-size: 11px;
+        color: #666;
+        font-weight: 500;
+    }
+    .adjustment-slider {
+        width: 100%;
+        height: 4px;
+        border-radius: 2px;
+        -webkit-appearance: none;
+        background: linear-gradient(to right, #666 0%, #e0e0e0 50%, #fff 100%);
+    }
+    .adjustment-slider::-webkit-slider-thumb {
+        -webkit-appearance: none;
+        width: 14px;
+        height: 14px;
+        border-radius: 50%;
+        background: #0d6efd;
+        cursor: pointer;
+    }
+    .adjustment-slider::-moz-range-thumb {
+        width: 14px;
+        height: 14px;
+        border-radius: 50%;
+        background: #0d6efd;
+        cursor: pointer;
+        border: none;
     }
     .canvas-wrapper {
         position: relative;
@@ -1259,6 +1418,13 @@ class BioImageViewer(anywidget.AnyWidget):
         .layer-toggle.visible {
             color: #0d6efd;
         }
+        .layer-action-btn {
+            color: #888;
+        }
+        .layer-action-btn:hover {
+            background: #404040;
+            color: #fff;
+        }
         .layer-divider {
             background: #404040;
         }
@@ -1269,6 +1435,12 @@ class BioImageViewer(anywidget.AnyWidget):
         }
         .opacity-item input[type="range"] {
             background: #404040;
+        }
+        .slider-label {
+            color: #888;
+        }
+        .adjustment-slider {
+            background: linear-gradient(to right, #333 0%, #666 50%, #999 100%);
         }
     }
     """
@@ -1281,6 +1453,8 @@ class BioImageViewer(anywidget.AnyWidget):
 
     # Layer controls
     image_visible = traitlets.Bool(True).tag(sync=True)
+    image_brightness = traitlets.Float(0.0).tag(sync=True)  # -1.0 to 1.0
+    image_contrast = traitlets.Float(0.0).tag(sync=True)    # -1.0 to 1.0
 
     # Image dimensions
     width = traitlets.Int(0).tag(sync=True)
