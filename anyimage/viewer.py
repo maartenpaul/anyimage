@@ -6,11 +6,13 @@ import anywidget
 import traitlets
 
 from .mixins import (
+    AnnotationsMixin,
     ImageLoadingMixin,
     MaskManagementMixin,
-    AnnotationsMixin,
     SAMIntegrationMixin,
 )
+from .mixins.image_loading import LRUCache
+from .profiling import Profiler
 
 
 class BioImageViewer(
@@ -97,11 +99,10 @@ class BioImageViewer(
         self._mask_arrays = {}  # Store raw label arrays by mask id
         self._mask_caches = {}  # Cache rendered versions by mask id
         self._bioimage = None  # Store BioImage reference for lazy loading
-        self._slice_cache = {}  # LRU cache for slice data: (T, C, Z) -> np.ndarray
-        self._slice_cache_max_size = 128  # Max number of cached slices
-        self._tile_cache = {}  # (t, z, tx, ty, res) -> base64 PNG
-        self._tile_cache_max_size = 2048  # Max cached tiles (~400MB for your dataset)
+        self._slice_cache = LRUCache(max_size=128)  # LRU cache: (T, C, Z) -> np.ndarray
+        self._tile_cache = LRUCache(max_size=2048)  # LRU cache: (t, z, tx, ty, res) -> tile data
         self._prefetch_executor = ThreadPoolExecutor(max_workers=4)  # Background prefetching
+        self._profiler = Profiler.get_instance()  # Performance profiler
 
         # Observer for SAM label deletion
         self.observe(self._on_delete_sam_at, names=["_delete_sam_at"])

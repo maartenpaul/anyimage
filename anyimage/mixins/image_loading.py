@@ -2,16 +2,71 @@
 
 import base64
 import time
-from concurrent.futures import ThreadPoolExecutor
+from collections import OrderedDict
 
 import numpy as np
 
+from ..profiling import Profiler
 from ..utils import (
     CHANNEL_COLORS,
     array_to_base64,
     composite_channels,
     normalize_image,
 )
+
+
+class LRUCache:
+    """Simple LRU cache using OrderedDict for O(1) access and eviction.
+
+    Attributes:
+        max_size: Maximum number of entries before eviction.
+    """
+
+    def __init__(self, max_size: int) -> None:
+        self._data: OrderedDict = OrderedDict()
+        self.max_size = max_size
+
+    def __contains__(self, key) -> bool:
+        return key in self._data
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def get(self, key, default=None):
+        if key in self._data:
+            # Move to end (most recently used)
+            self._data.move_to_end(key)
+            return self._data[key]
+        return default
+
+    def __getitem__(self, key):
+        self._data.move_to_end(key)
+        return self._data[key]
+
+    def __setitem__(self, key, value) -> None:
+        if key in self._data:
+            self._data.move_to_end(key)
+        self._data[key] = value
+        while len(self._data) > self.max_size:
+            self._data.popitem(last=False)
+
+    def __delitem__(self, key) -> None:
+        del self._data[key]
+
+    def clear(self) -> None:
+        self._data.clear()
+
+    def keys(self):
+        return self._data.keys()
+
+    def values(self):
+        return self._data.values()
+
+    def items(self):
+        return self._data.items()
+
+    def pop(self, key, *args):
+        return self._data.pop(key, *args)
 
 
 class ImageLoadingMixin:
@@ -93,6 +148,8 @@ class ImageLoadingMixin:
         Args:
             img: A BioImage object from bioio
         """
+        profiler = Profiler.get_instance()
+
         self._bioimage = img
 
         # Extract dimension sizes (BioImage uses TCZYX order)
@@ -109,7 +166,8 @@ class ImageLoadingMixin:
 
         # Compute global min/max for each channel by sampling slices
         # This ensures consistent normalization across all tiles, timeframes, and z-stacks
-        channel_ranges = self._compute_channel_ranges(img)
+        with profiler.track("compute_channel_ranges"):
+            channel_ranges = self._compute_channel_ranges(img)
 
         # Initialize channel settings with default colors and global ranges
         channel_settings = []
@@ -147,6 +205,7 @@ class ImageLoadingMixin:
 
         Samples slices across T and Z dimensions to estimate the global data range
         for consistent normalization across all tiles, timeframes, and z-stacks.
+        Uses spatial subsampling on large images to reduce computation time.
 
         Args:
             img: A BioImage object
@@ -157,8 +216,15 @@ class ImageLoadingMixin:
         channel_ranges = {}
 
         # Sample strategy: sample first, middle, and last T/Z positions
-        t_samples = list(set([0, self.dim_t // 2, self.dim_t - 1]))
-        z_samples = list(set([0, self.dim_z // 2, self.dim_z - 1]))
+        t_samples = sorted(set([0, self.dim_t // 2, self.dim_t - 1]))
+        z_samples = sorted(set([0, self.dim_z // 2, self.dim_z - 1]))
+
+        # For very large datasets, subsample spatially
+        # If image is larger than 1024x1024, use a stride to sample pixels
+        total_pixels = self.height * self.width
+        use_subsampling = total_pixels > 1024 * 1024
+        # Compute stride to sample ~1M pixels
+        stride = max(1, int(np.sqrt(total_pixels / (1024 * 1024))))
 
         for c in range(self.dim_c):
             global_min = float("inf")
@@ -168,10 +234,21 @@ class ImageLoadingMixin:
                 for z in z_samples:
                     try:
                         slice_data = img.get_image_dask_data("YX", T=t, C=c, Z=z).compute()
-                        slice_min = float(slice_data.min())
-                        slice_max = float(slice_data.max())
+                        if use_subsampling:
+                            # Subsample spatially for faster min/max
+                            sampled = slice_data[::stride, ::stride]
+                            slice_min = float(sampled.min())
+                            slice_max = float(sampled.max())
+                        else:
+                            slice_min = float(slice_data.min())
+                            slice_max = float(slice_data.max())
                         global_min = min(global_min, slice_min)
                         global_max = max(global_max, slice_max)
+
+                        # Cache the slice while we have it
+                        cache_key = (t, c, z)
+                        if cache_key not in self._slice_cache:
+                            self._slice_cache[cache_key] = slice_data
                     except Exception:
                         continue
 
@@ -194,16 +271,23 @@ class ImageLoadingMixin:
         Returns:
             2D numpy array of slice data
         """
+        profiler = Profiler.get_instance()
         cache_key = (t, c, z)
         if cache_key in self._slice_cache:
+            profiler.record_cache_hit("slice_cache")
             return self._slice_cache[cache_key]
 
-        ch_data = self._bioimage.get_image_dask_data("YX", T=t, C=c, Z=z).compute()
+        profiler.record_cache_miss("slice_cache")
 
-        if len(self._slice_cache) >= self._slice_cache_max_size:
-            del self._slice_cache[next(iter(self._slice_cache))]
+        start = time.perf_counter()
+        ch_data = self._bioimage.get_image_dask_data("YX", T=t, C=c, Z=z).compute()
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        profiler.record_operation("slice_load_disk", elapsed_ms)
 
         self._slice_cache[cache_key] = ch_data
+        profiler.update_cache_size(
+            "slice_cache", len(self._slice_cache), self._slice_cache.max_size
+        )
         return ch_data
 
     def _get_tile(self, t: int, z: int, tile_x: int, tile_y: int):
@@ -218,9 +302,14 @@ class ImageLoadingMixin:
         Returns:
             Dictionary with tile data {w, h, data} or None if tile is empty
         """
+        profiler = Profiler.get_instance()
+
         cache_key = (t, z, tile_x, tile_y, self.current_resolution)
         if cache_key in self._tile_cache:
+            profiler.record_cache_hit("tile_cache")
             return self._tile_cache[cache_key]
+
+        profiler.record_cache_miss("tile_cache")
 
         y_start = tile_y * self._tile_size
         x_start = tile_x * self._tile_size
@@ -249,11 +338,12 @@ class ImageLoadingMixin:
         if not visible_channels:
             return None
 
+        start = time.perf_counter()
         composite = composite_channels(visible_channels, colors, mins, maxs, data_mins, data_maxs)
         h, w = composite.shape[:2]
 
-        # Convert RGB to RGBA (add alpha channel)
-        rgba = np.zeros((h, w, 4), dtype=np.uint8)
+        # Convert RGB to RGBA (add alpha channel) - pre-allocate with alpha=255
+        rgba = np.empty((h, w, 4), dtype=np.uint8)
         rgba[:, :, :3] = composite
         rgba[:, :, 3] = 255
 
@@ -262,10 +352,13 @@ class ImageLoadingMixin:
             "w": w, "h": h,
             "data": base64.b64encode(rgba.tobytes()).decode("utf-8")
         }
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        profiler.record_operation("tile_composite_encode", elapsed_ms)
 
-        if len(self._tile_cache) >= self._tile_cache_max_size:
-            del self._tile_cache[next(iter(self._tile_cache))]
         self._tile_cache[cache_key] = tile_data
+        profiler.update_cache_size(
+            "tile_cache", len(self._tile_cache), self._tile_cache.max_size
+        )
 
         return tile_data
 
@@ -275,6 +368,7 @@ class ImageLoadingMixin:
         Args:
             change: Traitlet change dict with 'new' containing the tile request
         """
+        profiler = Profiler.get_instance()
         start_total = time.perf_counter()
 
         request = change.get("new")
@@ -300,6 +394,7 @@ class ImageLoadingMixin:
                         num_generated += 1
 
         elapsed = (time.perf_counter() - start_total) * 1000
+        profiler.record_operation("tile_request_batch", elapsed)
         print(f"[Py] {num_generated} new + {num_cached} cached tiles in {elapsed:.0f}ms")
         self._tiles_data = tiles_data
 
@@ -318,8 +413,7 @@ class ImageLoadingMixin:
             return
         try:
             ch_data = self._bioimage.get_image_dask_data("YX", T=t, C=c, Z=z).compute()
-            if len(self._slice_cache) < self._slice_cache_max_size:
-                self._slice_cache[cache_key] = ch_data
+            self._slice_cache[cache_key] = ch_data
         except Exception:
             pass
 
@@ -344,73 +438,78 @@ class ImageLoadingMixin:
         if self._bioimage is None:
             return
 
+        profiler = Profiler.get_instance()
+
         try:
-            # Get visible channels
-            visible_channels = []
-            colors = []
-            mins = []
-            maxs = []
-            data_mins = []
-            data_maxs = []
+            with profiler.track("update_slice"):
+                # Get visible channels
+                visible_channels = []
+                colors = []
+                mins = []
+                maxs = []
+                data_mins = []
+                data_maxs = []
 
-            # In preview mode, only use cached data (no disk I/O)
-            preview_mode = self._preview_mode
+                # In preview mode, only use cached data (no disk I/O)
+                preview_mode = self._preview_mode
 
-            for i, ch_settings in enumerate(self._channel_settings):
-                if ch_settings.get("visible", True):
-                    cache_key = (self.current_t, i, self.current_z)
-                    if cache_key in self._slice_cache:
-                        # Use cached data
-                        ch_data = self._slice_cache[cache_key]
-                    elif preview_mode:
-                        # In preview mode, skip uncached channels (don't block on I/O)
-                        # Schedule background load instead
-                        self._prefetch_executor.submit(
-                            self._prefetch_slice, self.current_t, i, self.current_z
-                        )
-                        continue
-                    else:
-                        # Not in preview mode, load from disk
-                        ch_data = self._get_slice_cached(self.current_t, i, self.current_z)
+                for i, ch_settings in enumerate(self._channel_settings):
+                    if ch_settings.get("visible", True):
+                        cache_key = (self.current_t, i, self.current_z)
+                        if cache_key in self._slice_cache:
+                            # Use cached data
+                            ch_data = self._slice_cache[cache_key]
+                        elif preview_mode:
+                            # In preview mode, skip uncached channels (don't block on I/O)
+                            # Schedule background load instead
+                            self._prefetch_executor.submit(
+                                self._prefetch_slice, self.current_t, i, self.current_z
+                            )
+                            continue
+                        else:
+                            # Not in preview mode, load from disk
+                            ch_data = self._get_slice_cached(self.current_t, i, self.current_z)
 
-                    visible_channels.append(ch_data)
-                    colors.append(ch_settings.get("color", "#ffffff"))
-                    mins.append(ch_settings.get("min", 0.0))
-                    maxs.append(ch_settings.get("max", 1.0))
-                    data_mins.append(ch_settings.get("data_min"))
-                    data_maxs.append(ch_settings.get("data_max"))
+                        visible_channels.append(ch_data)
+                        colors.append(ch_settings.get("color", "#ffffff"))
+                        mins.append(ch_settings.get("min", 0.0))
+                        maxs.append(ch_settings.get("max", 1.0))
+                        data_mins.append(ch_settings.get("data_min"))
+                        data_maxs.append(ch_settings.get("data_max"))
 
-            if not visible_channels:
-                # No visible channels (or all uncached in preview mode)
-                if not preview_mode:
-                    normalized = np.zeros((self.height, self.width), dtype=np.uint8)
+                if not visible_channels:
+                    # No visible channels (or all uncached in preview mode)
+                    if not preview_mode:
+                        normalized = np.zeros((self.height, self.width), dtype=np.uint8)
+                        self._image_array = normalized
+                        self.image_data = array_to_base64(normalized)
+                    return
+
+                if len(visible_channels) == 1 and colors[0] == "#ffffff":
+                    # Single grayscale channel - no compositing needed
+                    global_min = data_mins[0] if data_mins and data_mins[0] is not None else None
+                    global_max = data_maxs[0] if data_maxs and data_maxs[0] is not None else None
+                    normalized = normalize_image(visible_channels[0], global_min, global_max)
+                    # Apply contrast
+                    vmin, vmax = mins[0], maxs[0]
+                    if vmin > 0 or vmax < 1:
+                        normalized = normalized.astype(np.float32) / 255.0
+                        normalized = np.clip((normalized - vmin) / (vmax - vmin + 1e-10), 0, 1)
+                        normalized = (normalized * 255).astype(np.uint8)
                     self._image_array = normalized
                     self.image_data = array_to_base64(normalized)
-                return
+                else:
+                    # Composite multiple channels
+                    composite = composite_channels(
+                        visible_channels, colors, mins, maxs, data_mins, data_maxs
+                    )
+                    # Store grayscale version for SAM
+                    self._image_array = np.mean(composite, axis=2).astype(np.uint8)
+                    self.image_data = array_to_base64(composite)
 
-            if len(visible_channels) == 1 and colors[0] == "#ffffff":
-                # Single grayscale channel - no compositing needed
-                global_min = data_mins[0] if data_mins and data_mins[0] is not None else None
-                global_max = data_maxs[0] if data_maxs and data_maxs[0] is not None else None
-                normalized = normalize_image(visible_channels[0], global_min, global_max)
-                # Apply contrast
-                vmin, vmax = mins[0], maxs[0]
-                if vmin > 0 or vmax < 1:
-                    normalized = normalized.astype(np.float64) / 255.0
-                    normalized = np.clip((normalized - vmin) / (vmax - vmin + 1e-10), 0, 1)
-                    normalized = (normalized * 255).astype(np.uint8)
-                self._image_array = normalized
-                self.image_data = array_to_base64(normalized)
-            else:
-                # Composite multiple channels
-                composite = composite_channels(visible_channels, colors, mins, maxs, data_mins, data_maxs)
-                # Store grayscale version for SAM
-                self._image_array = np.mean(composite, axis=2).astype(np.uint8)
-                self.image_data = array_to_base64(composite)
-
-            # Pre-fetch adjacent slices for smoother navigation (not in preview mode)
-            if not preview_mode:
-                self._prefetch_adjacent_slices()
+                # Pre-fetch adjacent slices for smoother navigation (not in preview mode)
+                if not preview_mode:
+                    self._prefetch_adjacent_slices()
 
         except Exception as e:
             print(f"Error updating slice: {e}")
