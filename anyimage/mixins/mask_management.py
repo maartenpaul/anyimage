@@ -1,5 +1,9 @@
 """Mask management mixin for BioImageViewer."""
 
+from __future__ import annotations
+
+from typing import Any
+
 import numpy as np
 import pandas as pd
 
@@ -15,12 +19,12 @@ class MaskManagementMixin:
 
     This mixin handles adding, removing, and updating mask layers,
     including support for contour rendering and opacity control.
-
-    Attributes expected to be defined by the main class:
-        - _mask_arrays: Dict storing raw label arrays by mask id
-        - _mask_caches: Dict storing rendered versions by mask id
-        - _masks_data: List of mask layer dicts (traitlet)
     """
+
+    # Type annotations for attributes provided by the composite BioImageViewer class
+    _mask_arrays: dict[str, np.ndarray]
+    _mask_caches: dict[str, dict[tuple[bool, int], str]]
+    _masks_data: list[dict[str, Any]]
 
     def add_mask(
         self,

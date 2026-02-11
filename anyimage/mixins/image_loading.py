@@ -1,8 +1,12 @@
 """Image loading mixin for BioImageViewer."""
 
+from __future__ import annotations
+
 import base64
 import time
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any
 
 import numpy as np
 
@@ -75,28 +79,32 @@ class ImageLoadingMixin:
     This mixin handles loading images from numpy arrays and BioImage objects,
     including support for multi-dimensional data (5D: TCZYX), lazy loading,
     tile-based rendering, and slice caching.
-
-    Attributes expected to be defined by the main class:
-        - _bioimage: Reference to BioImage object for lazy loading
-        - _slice_cache: LRU cache for slice data
-        - _slice_cache_max_size: Max number of cached slices
-        - _tile_cache: Cache for rendered tiles
-        - _tile_cache_max_size: Max cached tiles
-        - _prefetch_executor: ThreadPoolExecutor for background prefetching
-        - _image_array: Current image array (for SAM integration)
-        - _channel_settings: List of channel settings dicts
-        - dim_t, dim_c, dim_z: Dimension sizes
-        - current_t, current_c, current_z: Current positions
-        - current_resolution: Current resolution level
-        - width, height: Image dimensions
-        - image_data: Base64 encoded image data (traitlet)
-        - _preview_mode: Preview mode flag (traitlet)
-        - _tile_size: Tile size (traitlet)
-        - _tiles_data: Tiles data dict (traitlet)
-        - resolution_levels: List of resolution levels (traitlet)
-        - scenes: List of scenes (traitlet)
-        - current_scene: Current scene name (traitlet)
     """
+
+    # Type annotations for attributes provided by the composite BioImageViewer class.
+    # These are defined at runtime by BioImageViewer.__init__ and traitlets.
+    _bioimage: Any
+    _slice_cache: LRUCache
+    _tile_cache: LRUCache
+    _prefetch_executor: ThreadPoolExecutor
+    _image_array: np.ndarray | None
+    _channel_settings: list[dict[str, Any]]
+    dim_t: int
+    dim_c: int
+    dim_z: int
+    current_t: int
+    current_c: int
+    current_z: int
+    current_resolution: int
+    width: int
+    height: int
+    image_data: str
+    _preview_mode: bool
+    _tile_size: int
+    _tiles_data: dict[str, Any]
+    resolution_levels: list[int]
+    scenes: list[str]
+    current_scene: str
 
     def set_image(self, data):
         """Set the base image from a numpy array or BioImage object.

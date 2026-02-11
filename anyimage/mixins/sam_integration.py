@@ -1,5 +1,9 @@
 """SAM (Segment Anything Model) integration mixin for BioImageViewer."""
 
+from __future__ import annotations
+
+from typing import Any
+
 import numpy as np
 
 from ..utils import array_to_base64, labels_to_rgba
@@ -10,29 +14,32 @@ class SAMIntegrationMixin:
 
     This mixin enables automatic segmentation using SAM (Segment Anything Model)
     triggered by drawing ROIs or placing points on the image.
-
-    Attributes expected to be defined by the main class:
-        - _sam_model: The loaded SAM model instance
-        - _sam_enabled: Whether SAM is enabled
-        - _sam_model_type: Type of SAM model loaded
-        - _processed_roi_ids: Set of ROI IDs that have been processed
-        - _processed_point_ids: Set of point IDs that have been processed
-        - _sam_label_counter: Counter for unique label IDs
-        - _sam_mask_id: ID of the SAM mask layer
-        - _sam_labels_array: Combined labels array for SAM masks
-        - _image_array: Current image array for SAM input
-        - _mask_arrays: Dict storing raw label arrays by mask id
-        - _mask_caches: Dict storing rendered versions by mask id
-        - _masks_data: List of mask layer dicts (traitlet)
-        - _rois_data: List of ROI dicts (traitlet)
-        - _points_data: List of point dicts (traitlet)
-        - _delete_sam_at: Coordinates for SAM label deletion (traitlet)
-        - width, height: Image dimensions
-        - add_mask: Method to add a mask layer
-        - remove_mask: Method to remove a mask layer
-        - observe: Traitlet observe method
-        - unobserve: Traitlet unobserve method
     """
+
+    # Type annotations for attributes provided by the composite BioImageViewer class
+    _sam_model: Any
+    _sam_enabled: bool
+    _sam_model_type: str | None
+    _processed_roi_ids: set[str]
+    _processed_point_ids: set[str]
+    _sam_label_counter: int
+    _sam_mask_id: str | None
+    _sam_labels_array: np.ndarray | None
+    _image_array: np.ndarray | None
+    _mask_arrays: dict[str, np.ndarray]
+    _mask_caches: dict[str, dict[tuple[bool, int], str]]
+    _masks_data: list[dict[str, Any]]
+    _rois_data: list[dict[str, Any]]
+    _points_data: list[dict[str, Any]]
+    _delete_sam_at: dict[str, Any] | None
+    width: int
+    height: int
+
+    # Methods provided by other mixins
+    def add_mask(self, labels: np.ndarray, **kwargs: Any) -> str: ...  # type: ignore[empty-body]
+    def remove_mask(self, mask_id: str) -> None: ...
+    def observe(self, handler: Any, names: Any = None, type: str = "change") -> None: ...
+    def unobserve(self, handler: Any, names: Any = None, type: str = "change") -> None: ...
 
     def enable_sam(self, model_type: str = "mobile_sam"):
         """Enable SAM segmentation triggered by rectangle ROIs or points.

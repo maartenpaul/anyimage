@@ -1,5 +1,9 @@
 """Annotations mixin for BioImageViewer."""
 
+from __future__ import annotations
+
+from typing import Any
+
 import pandas as pd
 
 
@@ -8,14 +12,14 @@ class AnnotationsMixin:
 
     This mixin handles ROIs (rectangles), polygons, and point annotations,
     providing DataFrame interfaces for easy data access and manipulation.
-
-    Attributes expected to be defined by the main class:
-        - _rois_data: List of ROI dicts (traitlet)
-        - _polygons_data: List of polygon dicts (traitlet)
-        - _points_data: List of point dicts (traitlet)
-        - selected_annotation_id: Selected annotation ID (traitlet)
-        - selected_annotation_type: Selected annotation type (traitlet)
     """
+
+    # Type annotations for attributes provided by the composite BioImageViewer class
+    _rois_data: list[dict[str, Any]]
+    _polygons_data: list[dict[str, Any]]
+    _points_data: list[dict[str, Any]]
+    selected_annotation_id: str
+    selected_annotation_type: str
 
     @property
     def rois_df(self) -> pd.DataFrame:
