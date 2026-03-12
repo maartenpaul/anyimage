@@ -31,10 +31,13 @@ anyimage/
 This project uses `uv` for package management:
 
 ```bash
-uv pip install -e ".[all]"   # Full install with all dependencies
-uv pip install -e ".[dev]"   # Development dependencies only
-uv pip install -e ".[sam]"   # SAM model support
+uv pip install -e ".[all]"      # Recommended: all dependencies except SAM
+uv pip install -e ".[dev]"      # Development dependencies only
+uv pip install -e ".[sam]"      # SAM model support (requires PyTorch)
+uv pip install -e ".[complete]" # Everything including SAM
 ```
+
+**Note:** The `sam` extra requires PyTorch and may not work on Python 3.13+. Use Python 3.10-3.12 for SAM features.
 
 ## Usage
 
