@@ -5,21 +5,26 @@ An interactive image viewer widget for Jupyter/marimo notebooks with support for
 ## Installation
 
 ```bash
-# Install from source
+# Install from source (minimal dependencies)
 uv pip install -e .
 
-# With SAM support
+# With all recommended dependencies (excludes SAM/PyTorch)
+uv pip install -e ".[all]"
+
+# With SAM support (requires PyTorch, may not work on Python 3.13+)
 uv pip install -e ".[sam]"
 
-# With all optional dependencies
-uv pip install -e ".[all]"
+# With everything including SAM
+uv pip install -e ".[complete]"
 ```
 
 ### Optional Dependencies
-- `sam` - SAM/MobileSAM segmentation (`ultralytics`)
+- `sam` - SAM/MobileSAM segmentation (`ultralytics`, requires PyTorch)
 - `contours` - Contour rendering (`scipy`)
 - `bioio` - BioImage file reading (`bioio`, `bioio-tifffile`)
 - `dev` - Development tools (`marimo`, `pytest`, `ruff`)
+- `all` - All dependencies except SAM (recommended for Python 3.13+)
+- `complete` - All dependencies including SAM
 
 ## Quick Start
 
@@ -120,8 +125,11 @@ Automatic segmentation using Segment Anything Model (SAM) when drawing rectangle
 
 ### Installation
 ```bash
+# Requires PyTorch (may not work on Python 3.13+)
 uv pip install -e ".[sam]"
 ```
+
+**Note:** SAM support requires PyTorch via ultralytics. If you encounter installation issues on Python 3.13+, use Python 3.10-3.12 or install without the `sam` extra.
 
 ### Usage
 ```python
