@@ -14,6 +14,21 @@ from ..utils import (
 )
 
 
+_THUMBNAIL_MAX = 512  # Max dimension for tile-mode thumbnail (used as baseImage fallback)
+
+
+def _thumbnail(arr: np.ndarray, max_size: int = _THUMBNAIL_MAX) -> np.ndarray:
+    """Downsample array to fit within max_size using nearest-neighbor sampling."""
+    h, w = arr.shape[:2]
+    scale = max_size / max(h, w)
+    if scale >= 1.0:
+        return arr
+    new_h, new_w = max(1, int(h * scale)), max(1, int(w * scale))
+    ys = (np.arange(new_h) * h / new_h).astype(np.int32)
+    xs = (np.arange(new_w) * w / new_w).astype(np.int32)
+    return arr[ys[:, None], xs] if arr.ndim == 2 else arr[ys[:, None], xs, :]
+
+
 class ImageLoadingMixin:
     """Mixin class providing image loading functionality for BioImageViewer.
 
@@ -397,12 +412,17 @@ class ImageLoadingMixin:
                     data_mins.append(ch_settings.get("data_min"))
                     data_maxs.append(ch_settings.get("data_max"))
 
+            use_tile_mode = self._use_tile_mode
+
             if not visible_channels:
                 # No visible channels (or all uncached in preview mode)
                 if not preview_mode:
-                    normalized = np.zeros((self.height, self.width), dtype=np.uint8)
-                    self._image_array = normalized
-                    self.image_data = array_to_base64(normalized)
+                    if use_tile_mode:
+                        self.image_data = ""
+                    else:
+                        normalized = np.zeros((self.height, self.width), dtype=np.uint8)
+                        self._image_array = normalized
+                        self.image_data = array_to_base64(normalized)
                 return
 
             if len(visible_channels) == 1 and colors[0] == "#ffffff":
@@ -417,13 +437,19 @@ class ImageLoadingMixin:
                     normalized = np.clip((normalized - vmin) / (vmax - vmin + 1e-10), 0, 1)
                     normalized = (normalized * 255).astype(np.uint8)
                 self._image_array = normalized
-                self.image_data = array_to_base64(normalized)
+                if use_tile_mode:
+                    self.image_data = array_to_base64(_thumbnail(normalized))
+                else:
+                    self.image_data = array_to_base64(normalized)
             else:
                 # Composite multiple channels
                 composite = composite_channels(visible_channels, colors, mins, maxs, data_mins, data_maxs)
                 # Store grayscale version for SAM
                 self._image_array = np.mean(composite, axis=2).astype(np.uint8)
-                self.image_data = array_to_base64(composite)
+                if use_tile_mode:
+                    self.image_data = array_to_base64(_thumbnail(composite))
+                else:
+                    self.image_data = array_to_base64(composite)
 
             # Pre-fetch adjacent slices for smoother navigation (not in preview mode)
             if not preview_mode:

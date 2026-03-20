@@ -91,6 +91,7 @@ class BioImageViewer(
     _tile_size = traitlets.Int(256).tag(sync=True)
     _tile_request = traitlets.Dict(allow_none=True).tag(sync=True)
     _tiles_data = traitlets.Dict({}).tag(sync=True)
+    _use_tile_mode = traitlets.Bool(False).tag(sync=True)  # Set by JS when tile mode is active
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -188,12 +189,7 @@ class BioImageViewer(
         function requestTiles(tiles, t, z) {
             const cached = tiles.filter(tile => tileCache.has(tile.key)).length;
             const missing = tiles.filter(tile => !tileCache.has(tile.key) && !pendingTiles.has(tile.key));
-            if (missing.length === 0) {
-                if (cached > 0) console.log(`[JS] All ${cached} tiles from cache`);
-                return;
-            }
-
-            console.log(`[JS] Requesting ${missing.length} tiles (${cached} cached) for T=${t} Z=${z}`);
+            if (missing.length === 0) return;
             missing.forEach(tile => pendingTiles.add(tile.key));
             model.set('_tile_request', {
                 tiles: missing.map(t => ({ tx: t.tx, ty: t.ty })),
@@ -1137,15 +1133,19 @@ class BioImageViewer(
                                     Math.ceil(ghostEntry.img.width * scale), Math.ceil(ghostEntry.img.height * scale));
                                 ctx.globalAlpha = 1.0;
                             } else if (baseImage) {
-                                // Secondary fallback: draw region from baseImage (current slice composite)
-                                const srcX = tile.tx * TILE_SIZE;
-                                const srcY = tile.ty * TILE_SIZE;
-                                const srcW = Math.min(TILE_SIZE, imgWidth - srcX);
-                                const srcH = Math.min(TILE_SIZE, imgHeight - srcY);
+                                // Secondary fallback: draw region from baseImage thumbnail
+                                const thumbScaleX = baseImage.width / imgWidth;
+                                const thumbScaleY = baseImage.height / imgHeight;
+                                const srcX = Math.floor(tile.tx * TILE_SIZE * thumbScaleX);
+                                const srcY = Math.floor(tile.ty * TILE_SIZE * thumbScaleY);
+                                const srcW = Math.ceil(Math.min(TILE_SIZE, imgWidth - tile.tx * TILE_SIZE) * thumbScaleX);
+                                const srcH = Math.ceil(Math.min(TILE_SIZE, imgHeight - tile.ty * TILE_SIZE) * thumbScaleY);
                                 if (srcW > 0 && srcH > 0) {
                                     ctx.globalAlpha = 0.7;
                                     ctx.drawImage(baseImage, srcX, srcY, srcW, srcH,
-                                        screenX, screenY, Math.ceil(srcW * scale), Math.ceil(srcH * scale));
+                                        screenX, screenY,
+                                        Math.ceil(Math.min(TILE_SIZE, imgWidth - tile.tx * TILE_SIZE) * scale),
+                                        Math.ceil(Math.min(TILE_SIZE, imgHeight - tile.ty * TILE_SIZE) * scale));
                                     ctx.globalAlpha = 1.0;
                                 }
                             }
@@ -1397,7 +1397,6 @@ class BioImageViewer(
                     resLevels.length - 1
                 ));
                 if (optimalLevel !== model.get('current_resolution')) {
-                    console.log(`[JS] Auto LOD: scale=${scale.toFixed(2)} -> level ${optimalLevel}`);
                     model.set('current_resolution', optimalLevel);
                     model.save_changes();
                 }
@@ -1578,8 +1577,14 @@ class BioImageViewer(
         function checkTileMode() {
             const imageWidth = model.get('width');
             const imageHeight = model.get('height');
-            useTileMode = (imageWidth * imageHeight) >= (1024 * 1024);  // 1MP+ uses tiles
-            console.log(`[JS] Tile mode: ${useTileMode} (${imageWidth}x${imageHeight})`);
+            const newTileMode = (imageWidth * imageHeight) >= (1024 * 1024);  // 1MP+ uses tiles
+            if (newTileMode !== useTileMode) {
+                useTileMode = newTileMode;
+                model.set('_use_tile_mode', useTileMode);
+                model.save_changes();
+            } else {
+                useTileMode = newTileMode;
+            }
             if (useTileMode) clearTileCache();
         }
 
@@ -1655,24 +1660,20 @@ class BioImageViewer(
         }
 
         model.on('change:_tiles_data', async () => {
-            const start = performance.now();
             const tilesData = model.get('_tiles_data') || {};
-            const keys = Object.keys(tilesData);
-            let decoded = 0;
-            for (const [key, tileData] of Object.entries(tilesData)) {
-                if (tileData && !tileCache.has(key)) {
-                    try {
-                        const img = await decodeRawTile(tileData);
-                        cacheTile(key, img);
-                        pendingTiles.delete(key);
-                        decoded++;
-                    } catch (e) {
-                        console.error('Tile decode error:', e);
-                        pendingTiles.delete(key);
-                    }
+            const entries = Object.entries(tilesData).filter(([key, tileData]) => tileData && !tileCache.has(key));
+            if (entries.length === 0) return;
+            const decodePromises = entries.map(async ([key, tileData]) => {
+                try {
+                    const img = await decodeRawTile(tileData);
+                    cacheTile(key, img);
+                    pendingTiles.delete(key);
+                } catch (e) {
+                    console.error('Tile decode error:', e);
+                    pendingTiles.delete(key);
                 }
-            }
-            console.log(`[JS] Decoded ${decoded} tiles in ${(performance.now() - start).toFixed(0)}ms`);
+            });
+            await Promise.all(decodePromises);
             renderCanvas();
         });
 
