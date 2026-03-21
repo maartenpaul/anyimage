@@ -200,34 +200,48 @@ await page.waitForTimeout(20000);  // wait for cells to run
 
 **Python side (image_loading.py):**
 - `_full_array`: full TCZYX numpy array in RAM if ≤2GB (avoids per-slice zarr I/O)
-- `_composite_cache`: `(t, z, res)` → uint8 RGB array (2048×2048), max 64 entries FIFO
+- `_composite_cache`: `(t, z, res)` → uint8 RGB array, max 64 entries FIFO
 - `_tile_cache`: `(t, z, tx, ty, res)` → `{w, h, data: base64}`, max 2048 entries FIFO
-- `_precompute_all_composites`: background task, two-pass:
-  - Pass 1: viewport tiles only, all T/Z slices sorted by Manhattan distance from current → fast Z/T scrubbing at current zoom/pan
-  - Pass 2: off-screen tiles for all slices → full cache fill in background
+- `_precompute_all_composites(cancel_event)`: background task, two-pass:
+  - **Pass 1** — viewport tiles only, all T/Z slices sorted by Manhattan distance from current position. Makes Z/T scrubbing instant at the current zoom/pan.
+  - **Pass 2** — off-screen tiles for all slices. Fills the full cache in the background.
 - Restarts on: `set_image()`, channel settings change, viewport change (pan/zoom settles after 300ms)
-- `_viewport_tiles` traitlet: JS reports `{tx0, ty0, tx1, ty1}` tile range; Python uses it to focus Pass 1
+- `_viewport_tiles` traitlet: JS sends `{tx0, ty0, tx1, ty1}` tile range; Python uses it to scope Pass 1
+- `_viewport_tiles_all_cached(t, z)`: returns True when every viewport tile for (t,z) is in `_tile_cache` — used by `_update_slice()` to skip sending a thumbnail when tiles are already ready
+
+**`_update_slice()` fast path:**
+When `_viewport_tiles_all_cached(t, z)` is True, `_update_slice()` returns immediately without sending `image_data`. This means:
+- No thumbnail PNG is encoded or transferred
+- No `loadBaseImage` fires in JS
+- `change:current_t/z` triggers `renderCanvas()` directly
+- `requestTiles()` finds all tiles in `tileCache` and sends nothing
+- Result: **instant render from JS cache, zero round-trips**
 
 **JS side (viewer.py `_esm`):**
-- `tileCache`: `Map<key, ImageBitmap>`, max 4096 entries, true LRU (delete+re-insert on access)
-- `pendingTiles`: `Set<key>` prevents duplicate requests
-- `getVisibleTiles()`: computes only tiles in current viewport from scale/translateX/translateY
-- `requestTiles()`: debounced 30ms to coalesce rapid slider movements
-- `reportViewport()`: debounced 300ms after pan/zoom, sends tile range to Python
+- `tileCache`: `Map<key, ImageBitmap>`, max 4096 entries, true LRU (delete+re-insert on `getTile()`)
+- `pendingTiles`: `Set<key>` prevents duplicate in-flight requests
+- `getVisibleTiles()`: computes only tiles intersecting current viewport (scale/translateX/translateY)
+- `requestTiles()`: debounced 30ms — coalesces rapid slider calls into one websocket message
+- `reportViewport()`: debounced 300ms after pan/zoom ends, sends tile range to Python to restart precompute
 
 **Thumbnail (baseImage):**
-- Sent as fast PNG (`compress_level=1`, ~16ms) on every T/Z change
-- Shown as background while high-res tiles load — prevents blank canvas
+- Sent as PNG with `compress_level=1` (~16ms vs 81ms for default level 6) on cold T/Z navigation
+- Drawn as canvas background while high-res tiles load — prevents blank canvas
 - Tiles overdraw it at full resolution as they arrive
+- Skipped entirely when viewport tiles are already cached (fast path above)
 
 ### Expected performance (image.zarr, 10T×3Z×2048×2048)
 
-At fit-to-screen zoom (64 tiles/slice visible):
-- `set_image`: ~2s (loads 252MB into RAM)
-- Thumbnail appears: ~20ms after navigation
-- Full tile render (cold, precompute running): ~500ms
-- Full tile render (cached, precompute done): ~50ms
+**Fit-to-screen zoom** (64 tiles/slice visible, all slices = 1920 tiles):
+- `set_image`: ~2s (loads 252MB into RAM, starts precompute)
+- First T/Z navigation: thumbnail in ~20ms, full tiles in ~500ms
+- After precompute Pass 1 (~30s): all T/Z instant from cache (~50ms)
 
-At 4× zoom (4 tiles/slice visible):
-- After viewport settles (300ms), Pass 1 caches 4 tiles × 30 slices = 120 tiles in ~2s
-- Z/T scrubbing after that: ~50ms (all viewport tiles already cached)
+**4× zoom** (4 tiles/slice visible):
+- Viewport reported after 300ms of holding still
+- Pass 1 caches 4 × 30 = 120 tiles in ~2s
+- All T/Z navigation and play after that: **instant, zero round-trips**
+
+**Play mode:**
+- While precompute Pass 1 is running: thumbnail flash on each frame
+- After Pass 1 complete: pure JS render, no Python involvement, smooth playback
