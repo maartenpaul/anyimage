@@ -93,6 +93,8 @@ class BioImageViewer(
     _tiles_data = traitlets.Dict({}).tag(sync=True)
     _use_tile_mode = traitlets.Bool(False).tag(sync=True)  # Set by JS when tile mode is active
     _cache_progress = traitlets.Float(0.0).tag(sync=True)  # 0.0–1.0 background cache fill progress
+    # Viewport tile range sent by JS on pan/zoom — used to prioritise precompute
+    _viewport_tiles = traitlets.Dict({}).tag(sync=True)
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -121,6 +123,7 @@ class BioImageViewer(
 
         # Observer for tile-based loading
         self.observe(self._on_tile_request, names=["_tile_request"])
+        self.observe(self._on_viewport_change, names=["_viewport_tiles"])
 
     _esm = """
     async function loadImage(base64Data) {
@@ -192,6 +195,27 @@ class BioImageViewer(
             tileCache.delete(key);
             tileCache.set(key, img);
             return img;
+        }
+
+        // Report visible tile range to Python so precompute prioritises the viewport.
+        // Debounced: fires 300ms after pan/zoom settles to avoid flooding during interaction.
+        let _viewportTimer = null;
+        function reportViewport() {
+            clearTimeout(_viewportTimer);
+            _viewportTimer = setTimeout(() => {
+                if (!useTileMode) return;
+                const imgWidth = model.get('width');
+                const imgHeight = model.get('height');
+                const vt = getVisibleTiles(scale, translateX, translateY,
+                    canvas.width, canvas.height, imgWidth, imgHeight, 0, 0);
+                if (vt.length === 0) return;
+                const txs = vt.map(t => t.tx), tys = vt.map(t => t.ty);
+                model.set('_viewport_tiles', {
+                    tx0: Math.min(...txs), ty0: Math.min(...tys),
+                    tx1: Math.max(...txs) + 1, ty1: Math.max(...tys) + 1
+                });
+                model.save_changes();
+            }, 300);
         }
 
         let _tileRequestTimer = null;
@@ -629,10 +653,12 @@ class BioImageViewer(
                     } else {
                         playBtn.innerHTML = '\u23F8';
                         playInterval = setInterval(() => {
-                            let val = model.get(currentKey) + 1;
-                            if (val >= maxVal) val = 0;
-                            model.set(currentKey, val);
+                            const next = (model.get(currentKey) + 1) % maxVal;
+                            model.set(currentKey, next);
                             model.save_changes();
+                            // renderCanvas() fires via change:current_t/z listener.
+                            // If all viewport tiles are in tileCache, requestTiles() sends nothing
+                            // and Python skips image_data update → no thumbnail flash, instant render.
                         }, playSpeed);
                     }
                 });
@@ -1406,6 +1432,7 @@ class BioImageViewer(
             }
 
             renderCanvas();
+            reportViewport();
         });
 
         canvas.addEventListener('mousedown', (e) => {
@@ -1567,6 +1594,7 @@ class BioImageViewer(
                 if (model.get('tool_mode') === 'pan') {
                     canvas.style.cursor = 'grab';
                 }
+                reportViewport();  // Pan finished — update precompute priority
             }
         });
 
@@ -1603,6 +1631,7 @@ class BioImageViewer(
             } else {
                 renderCanvas();
             }
+            reportViewport();
         }
 
         await loadBaseImage();

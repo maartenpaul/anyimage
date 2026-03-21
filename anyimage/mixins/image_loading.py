@@ -414,10 +414,25 @@ class ImageLoadingMixin:
                     except Exception:
                         pass
 
+    def _get_viewport_tile_ranges(self) -> tuple[int, int, int, int] | None:
+        """Return (tx_start, ty_start, tx_end, ty_end) from the last JS viewport report, or None."""
+        vp = getattr(self, "_viewport_tiles", {})
+        if not vp:
+            return None
+        try:
+            return (int(vp["tx0"]), int(vp["ty0"]), int(vp["tx1"]), int(vp["ty1"]))
+        except (KeyError, TypeError, ValueError):
+            return None
+
     def _precompute_all_composites(self, cancel_event) -> None:
         """Background task: composite all (t,z) slices and pre-render their tiles.
 
-        Prioritises slices nearest current (t, z) so neighbours are ready first.
+        Strategy:
+          Pass 1 — viewport tiles only, all T/Z slices, sorted by distance from current.
+                    This makes Z/T scrubbing instant for whatever the user is looking at.
+          Pass 2 — remaining (non-viewport) tiles for all slices.
+                    Fills the full cache in the background.
+
         Only runs when _full_array is in RAM. Cancelled via cancel_event.
         """
         if self._full_array is None:
@@ -426,20 +441,41 @@ class ImageLoadingMixin:
         t_center, z_center = self.current_t, self.current_z
         res = self.current_resolution
 
+        n_tiles_x = (self.width + self._tile_size - 1) // self._tile_size
+        n_tiles_y = (self.height + self._tile_size - 1) // self._tile_size
+
         slices = sorted(
             [(t, z) for t in range(self.dim_t) for z in range(self.dim_z)],
             key=lambda tz: abs(tz[0] - t_center) + abs(tz[1] - z_center),
         )
         total = len(slices)
-        n_tiles_x = (self.width + self._tile_size - 1) // self._tile_size
-        n_tiles_y = (self.height + self._tile_size - 1) // self._tile_size
-        # Report progress at most every 10% to limit websocket traffic
         report_every = max(1, total // 10)
 
+        vp = self._get_viewport_tile_ranges()
+        if vp:
+            vp_tx0, vp_ty0, vp_tx1, vp_ty1 = vp
+            viewport_tiles = [
+                (tx, ty)
+                for ty in range(max(0, vp_ty0), min(n_tiles_y, vp_ty1))
+                for tx in range(max(0, vp_tx0), min(n_tiles_x, vp_tx1))
+            ]
+            offscreen_tiles = [
+                (tx, ty)
+                for ty in range(n_tiles_y)
+                for tx in range(n_tiles_x)
+                if (tx, ty) not in set(viewport_tiles)
+            ]
+        else:
+            # No viewport info yet — treat everything as viewport
+            viewport_tiles = [(tx, ty) for ty in range(n_tiles_y) for tx in range(n_tiles_x)]
+            offscreen_tiles = []
+
+        # Pass 1: viewport tiles across all slices — makes Z/T scrubbing instant
         for i, (t, z) in enumerate(slices):
             if cancel_event.is_set():
                 return
 
+            # Composite is shared by both passes; compute once
             if (t, z, res) not in self._composite_cache:
                 try:
                     self._get_composite_slice(t, z)
@@ -449,18 +485,34 @@ class ImageLoadingMixin:
             if cancel_event.is_set():
                 return
 
-            for ty in range(n_tiles_y):
-                for tx in range(n_tiles_x):
-                    if cancel_event.is_set():
-                        return
-                    if (t, z, tx, ty, res) not in self._tile_cache:
-                        try:
-                            self._get_tile(t, z, tx, ty)
-                        except Exception:
-                            pass
+            for tx, ty in viewport_tiles:
+                if cancel_event.is_set():
+                    return
+                if (t, z, tx, ty, res) not in self._tile_cache:
+                    try:
+                        self._get_tile(t, z, tx, ty)
+                    except Exception:
+                        pass
 
             if (i + 1) % report_every == 0:
-                self._cache_progress = (i + 1) / total
+                self._cache_progress = (i + 1) / total / 2  # Pass 1 = first half of progress
+
+        # Pass 2: off-screen tiles for all slices (background fill)
+        for i, (t, z) in enumerate(slices):
+            if cancel_event.is_set():
+                return
+
+            for tx, ty in offscreen_tiles:
+                if cancel_event.is_set():
+                    return
+                if (t, z, tx, ty, res) not in self._tile_cache:
+                    try:
+                        self._get_tile(t, z, tx, ty)
+                    except Exception:
+                        pass
+
+            if (i + 1) % report_every == 0:
+                self._cache_progress = 0.5 + (i + 1) / total / 2  # Pass 2 = second half
 
         self._cache_progress = 1.0
 
@@ -497,6 +549,21 @@ class ImageLoadingMixin:
                     self._prefetch_executor.submit(self._prefetch_slice, t + delta, c, z)
                 self._prefetch_executor.submit(self._prefetch_tiles_for_slice, t + delta, z)
 
+    def _viewport_tiles_all_cached(self, t: int, z: int) -> bool:
+        """Return True if every viewport tile for (t, z) is already in the Python tile cache."""
+        vp = self._get_viewport_tile_ranges()
+        if not vp:
+            return False
+        tx0, ty0, tx1, ty1 = vp
+        res = self.current_resolution
+        n_tiles_x = (self.width + self._tile_size - 1) // self._tile_size
+        n_tiles_y = (self.height + self._tile_size - 1) // self._tile_size
+        for ty in range(max(0, ty0), min(n_tiles_y, ty1)):
+            for tx in range(max(0, tx0), min(n_tiles_x, tx1)):
+                if (t, z, tx, ty, res) not in self._tile_cache:
+                    return False
+        return True
+
     def _update_slice(self):
         """Update the displayed slice based on current T, Z positions and channel settings."""
         if self._bioimage is None:
@@ -508,7 +575,13 @@ class ImageLoadingMixin:
             preview_mode = self._preview_mode
 
             if use_tile_mode:
-                # In tile mode, use the composite cache — avoids duplicating compositing work
+                # Skip thumbnail update if all viewport tiles are already in Python cache.
+                # JS tileCache was pre-populated by precompute, so renderCanvas() will draw
+                # them immediately with no round-trip — no thumbnail flash needed.
+                if self._viewport_tiles_all_cached(t, z):
+                    return
+
+                # Composite is cached; thumbnail is the only new data needed
                 composite = self._get_composite_slice(t, z)
                 if composite is not None:
                     self._image_array = np.mean(composite, axis=2).astype(np.uint8)
@@ -591,6 +664,10 @@ class ImageLoadingMixin:
             composite_cache.clear()
         if clear_full_array:
             self._full_array = None
+
+    def _on_viewport_change(self, change):
+        """Restart precompute when the user pans or zooms to a new viewport."""
+        self._start_precompute()
 
     def _on_resolution_change(self, change):
         """Observer callback when resolution level changes."""

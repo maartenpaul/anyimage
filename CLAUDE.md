@@ -8,7 +8,7 @@ Interactive anywidget for visualizing biological images in Jupyter and marimo no
 - **Multi-layer mask overlays** - Customizable colors, opacity, and contour rendering
 - **Annotation tools** - Rectangles, polygons, and points with visibility controls
 - **SAM integration** - Segment Anything Model for interactive segmentation
-- **Tile-based rendering** - Efficient handling of large images with lazy loading
+- **Tile-based rendering** - Viewport-aware caching: precomputes visible tiles first across all T/Z, then fills the rest off-screen
 - **BioImage format support** - TIFF, OME-Zarr, and other formats via bioio
 
 ## Project Structure
@@ -196,13 +196,38 @@ for (const btn of buttons) {
 await page.waitForTimeout(20000);  // wait for cells to run
 ```
 
+### Caching architecture
+
+**Python side (image_loading.py):**
+- `_full_array`: full TCZYX numpy array in RAM if ≤2GB (avoids per-slice zarr I/O)
+- `_composite_cache`: `(t, z, res)` → uint8 RGB array (2048×2048), max 64 entries FIFO
+- `_tile_cache`: `(t, z, tx, ty, res)` → `{w, h, data: base64}`, max 2048 entries FIFO
+- `_precompute_all_composites`: background task, two-pass:
+  - Pass 1: viewport tiles only, all T/Z slices sorted by Manhattan distance from current → fast Z/T scrubbing at current zoom/pan
+  - Pass 2: off-screen tiles for all slices → full cache fill in background
+- Restarts on: `set_image()`, channel settings change, viewport change (pan/zoom settles after 300ms)
+- `_viewport_tiles` traitlet: JS reports `{tx0, ty0, tx1, ty1}` tile range; Python uses it to focus Pass 1
+
+**JS side (viewer.py `_esm`):**
+- `tileCache`: `Map<key, ImageBitmap>`, max 4096 entries, true LRU (delete+re-insert on access)
+- `pendingTiles`: `Set<key>` prevents duplicate requests
+- `getVisibleTiles()`: computes only tiles in current viewport from scale/translateX/translateY
+- `requestTiles()`: debounced 30ms to coalesce rapid slider movements
+- `reportViewport()`: debounced 300ms after pan/zoom, sends tile range to Python
+
+**Thumbnail (baseImage):**
+- Sent as fast PNG (`compress_level=1`, ~16ms) on every T/Z change
+- Shown as background while high-res tiles load — prevents blank canvas
+- Tiles overdraw it at full resolution as they arrive
+
 ### Expected performance (image.zarr, 10T×3Z×2048×2048)
 
-With the optimized code (eager loading + composite cache):
-- `set_image`: ~2s (loads full array into RAM)
-- First tile render (cold composite): ~30ms
-- Subsequent tiles (cached composite): ~0ms
-- T navigation (cold, first visit): ~500-900ms
-- T navigation (cached, revisit): ~50-400ms
-- Z navigation (cold): ~500ms
-- Z navigation (cached): ~50ms
+At fit-to-screen zoom (64 tiles/slice visible):
+- `set_image`: ~2s (loads 252MB into RAM)
+- Thumbnail appears: ~20ms after navigation
+- Full tile render (cold, precompute running): ~500ms
+- Full tile render (cached, precompute done): ~50ms
+
+At 4× zoom (4 tiles/slice visible):
+- After viewport settles (300ms), Pass 1 caches 4 tiles × 30 slices = 120 tiles in ~2s
+- Z/T scrubbing after that: ~50ms (all viewport tiles already cached)
