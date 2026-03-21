@@ -92,6 +92,7 @@ class BioImageViewer(
     _tile_request = traitlets.Dict(allow_none=True).tag(sync=True)
     _tiles_data = traitlets.Dict({}).tag(sync=True)
     _use_tile_mode = traitlets.Bool(False).tag(sync=True)  # Set by JS when tile mode is active
+    _cache_progress = traitlets.Float(0.0).tag(sync=True)  # 0.0–1.0 background cache fill progress
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -101,9 +102,13 @@ class BioImageViewer(
         self._full_array = None  # Full TCZYX array when image fits in RAM
         self._slice_cache = {}  # LRU cache for slice data: (T, C, Z) -> np.ndarray
         self._slice_cache_max_size = 128  # Max number of cached slices
+        self._composite_cache = {}  # (t, z, res) -> uint8 RGB composite of full slice
+        self._composite_cache_max_size = 64  # Max cached composites
         self._tile_cache = {}  # (t, z, tx, ty, res) -> base64 PNG
         self._tile_cache_max_size = 2048  # Max cached tiles (~400MB for your dataset)
         self._prefetch_executor = ThreadPoolExecutor(max_workers=6)  # Background prefetching
+        self._precompute_event = None   # threading.Event to cancel background precompute
+        self._precompute_future = None  # Future for the running precompute task
 
         # Observer for SAM label deletion
         self.observe(self._on_delete_sam_at, names=["_delete_sam_at"])
@@ -123,7 +128,8 @@ class BioImageViewer(
             const img = new Image();
             img.onload = () => resolve(img);
             img.onerror = reject;
-            img.src = 'data:image/png;base64,' + base64Data;
+            // Support both plain base64 (PNG) and full data URIs (JPEG thumbnails)
+            img.src = base64Data.startsWith('data:') ? base64Data : 'data:image/png;base64,' + base64Data;
         });
     }
 
@@ -146,11 +152,10 @@ class BioImageViewer(
         const TILE_SIZE = model.get('_tile_size') || 256;
         const tileCache = new Map();
         const pendingTiles = new Set();
-        const MAX_CACHE_SIZE = 2048;
+        // 4096 tiles @ 256×256×4 bytes = ~1GB RAM — comfortably holds a full 10T×3Z dataset
+        // (64 tiles/slice × 30 slices = 1920 tiles). Extra headroom prevents eviction on revisit.
+        const MAX_CACHE_SIZE = 4096;
         let useTileMode = false;
-        let ghostTiles = new Map();   // Previous frame's tiles for ghost rendering
-        let lastRenderedT = 0;
-        let lastRenderedZ = 0;
 
         function getVisibleTiles(scale, translateX, translateY, canvasWidth, canvasHeight, imageWidth, imageHeight, t, z) {
             const minX = Math.max(0, -translateX / scale);
@@ -174,29 +179,42 @@ class BioImageViewer(
 
         function cacheTile(key, img) {
             if (tileCache.size >= MAX_CACHE_SIZE) {
-                let oldestKey = null;
-                let oldestTime = Infinity;
-                for (const [k, v] of tileCache) {
-                    if (v.lastAccess < oldestTime) {
-                        oldestTime = v.lastAccess;
-                        oldestKey = k;
-                    }
-                }
-                if (oldestKey) tileCache.delete(oldestKey);
+                // Evict least-recently-used: Map preserves insertion order,
+                // so the first key is the oldest/least-recently accessed.
+                tileCache.delete(tileCache.keys().next().value);
             }
-            tileCache.set(key, { img, lastAccess: Date.now() });
+            tileCache.set(key, img);
         }
 
+        function getTile(key) {
+            const img = tileCache.get(key);
+            if (img === undefined) return undefined;
+            // LRU promotion: delete + re-insert moves key to end of Map (most-recently-used)
+            tileCache.delete(key);
+            tileCache.set(key, img);
+            return img;
+        }
+
+        let _tileRequestTimer = null;
+
         function requestTiles(tiles, t, z) {
-            const cached = tiles.filter(tile => tileCache.has(tile.key)).length;
             const missing = tiles.filter(tile => !tileCache.has(tile.key) && !pendingTiles.has(tile.key));
             if (missing.length === 0) return;
-            missing.forEach(tile => pendingTiles.add(tile.key));
-            model.set('_tile_request', {
-                tiles: missing.map(t => ({ tx: t.tx, ty: t.ty })),
-                t, z, timestamp: Date.now()
-            });
-            model.save_changes();
+            // Debounce: cancel any pending request and re-schedule with latest T/Z.
+            // During rapid scrubbing this coalesces multiple renderCanvas() calls into one
+            // websocket message, preventing a pile-up of stale tile requests.
+            clearTimeout(_tileRequestTimer);
+            _tileRequestTimer = setTimeout(() => {
+                // Re-filter in case tiles arrived while we were waiting
+                const stillMissing = missing.filter(tile => !tileCache.has(tile.key) && !pendingTiles.has(tile.key));
+                if (stillMissing.length === 0) return;
+                stillMissing.forEach(tile => pendingTiles.add(tile.key));
+                model.set('_tile_request', {
+                    tiles: stillMissing.map(tile => ({ tx: tile.tx, ty: tile.ty })),
+                    t, z, timestamp: Date.now()
+                });
+                model.save_changes();
+            }, 30);
         }
 
         // Prefetch tiles for adjacent T/Z slices
@@ -233,9 +251,6 @@ class BioImageViewer(
         function clearTileCache() {
             tileCache.clear();
             pendingTiles.clear();
-            ghostTiles.clear();
-            lastRenderedT = model.get('current_t') || 0;
-            lastRenderedZ = model.get('current_z') || 0;
         }
 
         const container = document.createElement('div');
@@ -1085,25 +1100,37 @@ class BioImageViewer(
 
             ctx.imageSmoothingEnabled = scale <= 1;
 
-            const checkSize = 10;
-            ctx.fillStyle = '#2a2a2a';
-            ctx.fillRect(0, 0, canvas.width, canvas.height);
-            ctx.fillStyle = '#3a3a3a';
-            for (let y = 0; y < canvas.height; y += checkSize) {
-                for (let x = 0; x < canvas.width; x += checkSize) {
-                    if ((Math.floor(x / checkSize) + Math.floor(y / checkSize)) % 2 === 0) {
-                        ctx.fillRect(x, y, checkSize, checkSize);
+            // Set up brightness/contrast filters
+            const brightness = model.get('image_brightness') || 0;
+            const contrast = model.get('image_contrast') || 0;
+            const brightnessPercent = (brightness * 100);
+            const contrastPercent = ((contrast + 1) * 100);
+
+            // Background: draw thumbnail if available, checkerboard only before first load
+            if (model.get('image_visible') && baseImage) {
+                ctx.save();
+                ctx.filter = `brightness(${100 + brightnessPercent}%) contrast(${contrastPercent}%)`;
+                ctx.translate(translateX, translateY);
+                ctx.scale(scale, scale);
+                // Stretch thumbnail to full image dimensions — tiles overdraw at full resolution
+                ctx.drawImage(baseImage, 0, 0, imgWidth, imgHeight);
+                ctx.restore();
+            } else {
+                // Checkerboard fallback (shown only before any image is loaded)
+                const checkSize = 10;
+                ctx.fillStyle = '#2a2a2a';
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+                ctx.fillStyle = '#3a3a3a';
+                for (let y = 0; y < canvas.height; y += checkSize) {
+                    for (let x = 0; x < canvas.width; x += checkSize) {
+                        if ((Math.floor(x / checkSize) + Math.floor(y / checkSize)) % 2 === 0) {
+                            ctx.fillRect(x, y, checkSize, checkSize);
+                        }
                     }
                 }
             }
 
             ctx.save();
-
-            // Set up brightness/contrast filters once
-            const brightness = model.get('image_brightness') || 0;
-            const contrast = model.get('image_contrast') || 0;
-            const brightnessPercent = (brightness * 100);
-            const contrastPercent = ((contrast + 1) * 100);
 
             if (model.get('image_visible')) {
                 ctx.filter = `brightness(${100 + brightnessPercent}%) contrast(${contrastPercent}%)`;
@@ -1111,65 +1138,41 @@ class BioImageViewer(
                 if (useTileMode) {
                     const t = model.get('current_t'), z = model.get('current_z');
                     const visibleTiles = getVisibleTiles(scale, translateX, translateY, canvas.width, canvas.height, imgWidth, imgHeight, t, z);
+
                     requestTiles(visibleTiles, t, z);
 
                     let allCached = true;
                     for (const tile of visibleTiles) {
-                        const entry = tileCache.get(tile.key);
-                        const screenX = Math.round(tile.tx * TILE_SIZE * scale + translateX);
-                        const screenY = Math.round(tile.ty * TILE_SIZE * scale + translateY);
-                        if (entry) {
-                            entry.lastAccess = Date.now();
-                            const drawW = Math.ceil(entry.img.width * scale);
-                            const drawH = Math.ceil(entry.img.height * scale);
-                            ctx.drawImage(entry.img, screenX, screenY, drawW, drawH);
+                        const img = getTile(tile.key);
+                        if (img) {
+                            const screenX = Math.round(tile.tx * TILE_SIZE * scale + translateX);
+                            const screenY = Math.round(tile.ty * TILE_SIZE * scale + translateY);
+                            ctx.drawImage(img, screenX, screenY,
+                                Math.ceil(img.width * scale), Math.ceil(img.height * scale));
                         } else {
                             allCached = false;
-                            // Fall back to ghost tile at same position (previous frame)
-                            const ghostKey = `${lastRenderedT}_${lastRenderedZ}_${tile.tx}_${tile.ty}`;
-                            const ghostEntry = ghostTiles.get(ghostKey);
-                            if (ghostEntry) {
-                                ctx.globalAlpha = 0.85;
-                                ctx.drawImage(ghostEntry.img, screenX, screenY,
-                                    Math.ceil(ghostEntry.img.width * scale), Math.ceil(ghostEntry.img.height * scale));
-                                ctx.globalAlpha = 1.0;
-                            } else if (baseImage) {
-                                // Secondary fallback: draw region from baseImage thumbnail
-                                const thumbScaleX = baseImage.width / imgWidth;
-                                const thumbScaleY = baseImage.height / imgHeight;
-                                const srcX = Math.floor(tile.tx * TILE_SIZE * thumbScaleX);
-                                const srcY = Math.floor(tile.ty * TILE_SIZE * thumbScaleY);
-                                const srcW = Math.ceil(Math.min(TILE_SIZE, imgWidth - tile.tx * TILE_SIZE) * thumbScaleX);
-                                const srcH = Math.ceil(Math.min(TILE_SIZE, imgHeight - tile.ty * TILE_SIZE) * thumbScaleY);
-                                if (srcW > 0 && srcH > 0) {
-                                    ctx.globalAlpha = 0.7;
-                                    ctx.drawImage(baseImage, srcX, srcY, srcW, srcH,
-                                        screenX, screenY,
-                                        Math.ceil(Math.min(TILE_SIZE, imgWidth - tile.tx * TILE_SIZE) * scale),
-                                        Math.ceil(Math.min(TILE_SIZE, imgHeight - tile.ty * TILE_SIZE) * scale));
-                                    ctx.globalAlpha = 1.0;
-                                }
-                            }
                         }
                     }
 
-                    // Once all new tiles loaded, update tracking and clear ghost
                     if (allCached && visibleTiles.length > 0) {
-                        lastRenderedT = t;
-                        lastRenderedZ = z;
-                        ghostTiles.clear();
                         prefetchAdjacentTiles(visibleTiles, t, z);
                     }
-                } else if (baseImage) {
-                    ctx.translate(translateX, translateY);
-                    ctx.scale(scale, scale);
-                    ctx.drawImage(baseImage, 0, 0);
-                    ctx.restore();
-                    ctx.save();
                 }
+                // Non-tile mode: baseImage already drawn above as background
 
                 ctx.filter = 'none';
             }
+
+            ctx.restore();
+
+            // Draw cache progress bar (outside save/restore stack, no transform applied)
+            const cacheProgress = model.get('_cache_progress') || 0;
+            if (cacheProgress > 0 && cacheProgress < 1.0) {
+                ctx.fillStyle = 'rgba(100, 180, 255, 0.6)';
+                ctx.fillRect(0, canvas.height - 3, canvas.width * cacheProgress, 3);
+            }
+
+            ctx.save();
 
             // Apply transform for mask overlays and annotations
             ctx.translate(translateX, translateY);
@@ -1678,20 +1681,8 @@ class BioImageViewer(
             renderCanvas();
         });
 
-        function onFrameChange() {
-            const newT = model.get('current_t');
-            const newZ = model.get('current_z');
-            if (newT !== lastRenderedT || newZ !== lastRenderedZ) {
-                ghostTiles.clear();
-                const prefix = `${lastRenderedT}_${lastRenderedZ}_`;
-                for (const [key, entry] of tileCache) {
-                    if (key.startsWith(prefix)) ghostTiles.set(key, entry);
-                }
-            }
-            renderCanvas();
-        }
-        model.on('change:current_t', onFrameChange);
-        model.on('change:current_z', onFrameChange);
+        model.on('change:current_t', renderCanvas);
+        model.on('change:current_z', renderCanvas);
         model.on('change:current_resolution', clearTileCache);
 
         new ResizeObserver(() => renderCanvas()).observe(canvasWrapper);

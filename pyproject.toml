@@ -1,6 +1,6 @@
 [project]
 name = "anyimage"
-version = "0.1.0"
+version = "0.2.0"
 description = "Interactive image viewer widget for Jupyter/marimo with annotation tools and SAM integration"
 readme = "README.md"
 license = { text = "MIT" }

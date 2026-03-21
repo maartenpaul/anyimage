@@ -140,3 +140,8 @@ dmypy.json
 *.h5
 *.tiff
 *.tif
+
+# Playwright screenshots
+*.png
+*.jpg
+*.jpeg

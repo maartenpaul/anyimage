@@ -1,6 +1,7 @@
 """Image loading mixin for BioImageViewer."""
 
 import base64
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -12,6 +13,7 @@ _EAGER_LOAD_BYTES = 2 * 1024 ** 3  # 2 GB
 from ..utils import (
     CHANNEL_COLORS,
     array_to_base64,
+    array_to_jpeg_base64,
     composite_channels,
     normalize_image,
 )
@@ -112,64 +114,77 @@ class ImageLoadingMixin:
             img: A BioImage object from bioio
         """
         self._bioimage = img
-        self._full_array = None  # Reset; may be populated below
+        self._full_array = None
 
-        # Extract dimension sizes (BioImage uses TCZYX order)
-        self.dim_t = img.dims.T
-        self.dim_c = img.dims.C
-        self.dim_z = img.dims.Z
-        self.height = img.dims.Y
-        self.width = img.dims.X
-
-        # If the full dataset fits in RAM, load it all now to avoid per-slice zarr I/O
+        # Pre-load full array into RAM if it fits (avoids per-slice zarr I/O during navigation)
         nbytes = img.dims.T * img.dims.C * img.dims.Z * img.dims.Y * img.dims.X * 2  # assume uint16
+        eager_array = None
         if nbytes <= _EAGER_LOAD_BYTES:
             try:
-                self._full_array = img.get_image_dask_data("TCZYX").compute()
-            except Exception:
-                self._full_array = None  # Fall back to per-slice loading
+                arr = img.get_image_dask_data("TCZYX").compute()
+                if not arr.dtype.isnative:
+                    arr = np.ascontiguousarray(arr.astype(arr.dtype.newbyteorder("=")))
+                eager_array = arr
+            except Exception as e:
+                print(f"[anyimage] Eager load failed, falling back to lazy loading: {e}")
 
-        # Reset current positions
-        self.current_t = 0
-        self.current_c = 0
-        self.current_z = 0
-
-        # Compute global min/max for each channel — use full array if available
-        if self._full_array is not None:
-            channel_ranges = self._compute_channel_ranges_from_array(self._full_array)
+        if eager_array is not None:
+            channel_ranges = self._compute_channel_ranges_from_array(eager_array)
         else:
             channel_ranges = self._compute_channel_ranges(img)
 
-        # Initialize channel settings with default colors and global ranges
-        channel_settings = []
-        for i in range(self.dim_c):
-            data_min, data_max = channel_ranges.get(i, (0.0, 1.0))
-            channel_settings.append({
-                "name": f"Channel {i}",
-                "color": CHANNEL_COLORS[i % len(CHANNEL_COLORS)],
-                "visible": True,
-                "min": 0.0,
-                "max": 1.0,
-                "data_min": float(data_min),
-                "data_max": float(data_max),
-            })
-        self._channel_settings = channel_settings
+        # Batch all traitlet assignments to suppress intermediate observer callbacks
+        with self.hold_trait_notifications():
+            # Extract dimension sizes (BioImage uses TCZYX order)
+            self.dim_t = img.dims.T
+            self.dim_c = img.dims.C
+            self.dim_z = img.dims.Z
+            self.height = img.dims.Y
+            self.width = img.dims.X
 
-        # Extract resolution levels if available
-        if hasattr(img, "resolution_levels") and img.resolution_levels:
-            self.resolution_levels = list(img.resolution_levels)
-            self.current_resolution = 0
-        else:
-            self.resolution_levels = []
+            # Pre-set tile mode for large images so _update_slice skips full PNG encoding
+            if img.dims.Y * img.dims.X >= 1024 * 1024:
+                self._use_tile_mode = True
 
-        # Extract scenes if available
-        if hasattr(img, "scenes") and img.scenes:
-            self.scenes = list(img.scenes)
-            self.current_scene = img.current_scene if hasattr(img, "current_scene") else ""
-        else:
-            self.scenes = []
+            # Reset current positions
+            self.current_t = 0
+            self.current_c = 0
+            self.current_z = 0
+
+            # Initialize channel settings with default colors and global ranges
+            channel_settings = []
+            for i in range(self.dim_c):
+                data_min, data_max = channel_ranges.get(i, (0.0, 1.0))
+                channel_settings.append({
+                    "name": f"Channel {i}",
+                    "color": CHANNEL_COLORS[i % len(CHANNEL_COLORS)],
+                    "visible": True,
+                    "min": 0.0,
+                    "max": 1.0,
+                    "data_min": float(data_min),
+                    "data_max": float(data_max),
+                })
+            self._channel_settings = channel_settings
+
+            # Extract resolution levels if available
+            if hasattr(img, "resolution_levels") and img.resolution_levels:
+                self.resolution_levels = list(img.resolution_levels)
+                self.current_resolution = 0
+            else:
+                self.resolution_levels = []
+
+            # Extract scenes if available
+            if hasattr(img, "scenes") and img.scenes:
+                self.scenes = list(img.scenes)
+                self.current_scene = img.current_scene if hasattr(img, "current_scene") else ""
+            else:
+                self.scenes = []
+
+            # Set full array inside hold so _clear_caches from scene/resolution observers can't wipe it
+            self._full_array = eager_array
 
         self._update_slice()
+        self._start_precompute()
 
     def _compute_channel_ranges(self, img) -> dict[int, tuple[float, float]]:
         """Compute global min/max ranges for each channel by sampling slices.
@@ -246,6 +261,41 @@ class ImageLoadingMixin:
         self._slice_cache[cache_key] = ch_data
         return ch_data
 
+    def _get_composite_slice(self, t: int, z: int) -> np.ndarray | None:
+        """Return the full composited RGB slice for (t, z), using a cache.
+
+        Compositing once per slice is far faster than compositing per tile,
+        since normalize/blend only runs once regardless of how many tiles are requested.
+        """
+        composite_cache: dict = getattr(self, "_composite_cache", {})
+        cache_key = (t, z, self.current_resolution)
+        if cache_key in composite_cache:
+            return composite_cache[cache_key]
+
+        visible_channels, colors, mins, maxs, data_mins, data_maxs = [], [], [], [], [], []
+        for i, ch_settings in enumerate(self._channel_settings):
+            if ch_settings.get("visible", True):
+                ch_data = self._get_slice_cached(t, i, z)
+                if ch_data is None or ch_data.size == 0:
+                    continue
+                visible_channels.append(ch_data)
+                colors.append(ch_settings.get("color", "#ffffff"))
+                mins.append(ch_settings.get("min", 0.0))
+                maxs.append(ch_settings.get("max", 1.0))
+                data_mins.append(ch_settings.get("data_min"))
+                data_maxs.append(ch_settings.get("data_max"))
+
+        if not visible_channels:
+            return None
+
+        result = composite_channels(visible_channels, colors, mins, maxs, data_mins, data_maxs)
+
+        composite_cache_max: int = getattr(self, "_composite_cache_max_size", 64)
+        if len(composite_cache) >= composite_cache_max:
+            del composite_cache[next(iter(composite_cache))]
+        composite_cache[cache_key] = result
+        return result
+
     def _get_tile(self, t: int, z: int, tile_x: int, tile_y: int):
         """Get a single tile as raw RGBA bytes (much faster than PNG).
 
@@ -270,31 +320,17 @@ class ImageLoadingMixin:
         y_end = min(y_start + self._tile_size, self.height)
         x_end = min(x_start + self._tile_size, self.width)
 
-        visible_channels, colors, mins, maxs, data_mins, data_maxs = [], [], [], [], [], []
-        for i, ch_settings in enumerate(self._channel_settings):
-            if ch_settings.get("visible", True):
-                ch_data = self._get_slice_cached(t, i, z)
-                if ch_data is None:
-                    continue
-                tile_slice = ch_data[y_start:y_end, x_start:x_end]
-                if tile_slice.size == 0:
-                    continue
-                visible_channels.append(tile_slice)
-                colors.append(ch_settings.get("color", "#ffffff"))
-                mins.append(ch_settings.get("min", 0.0))
-                maxs.append(ch_settings.get("max", 1.0))
-                data_mins.append(ch_settings.get("data_min"))
-                data_maxs.append(ch_settings.get("data_max"))
-
-        if not visible_channels:
+        composite = self._get_composite_slice(t, z)
+        if composite is None:
             return None
-
-        composite = composite_channels(visible_channels, colors, mins, maxs, data_mins, data_maxs)
-        h, w = composite.shape[:2]
+        region = composite[y_start:y_end, x_start:x_end]
+        if region.size == 0:
+            return None
+        h, w = region.shape[:2]
 
         # Convert RGB to RGBA (add alpha channel)
         rgba = np.zeros((h, w, 4), dtype=np.uint8)
-        rgba[:, :, :3] = composite
+        rgba[:, :, :3] = region
         rgba[:, :, 3] = 255
 
         # Raw bytes are ~10x faster than PNG encoding
@@ -378,6 +414,71 @@ class ImageLoadingMixin:
                     except Exception:
                         pass
 
+    def _precompute_all_composites(self, cancel_event) -> None:
+        """Background task: composite all (t,z) slices and pre-render their tiles.
+
+        Prioritises slices nearest current (t, z) so neighbours are ready first.
+        Only runs when _full_array is in RAM. Cancelled via cancel_event.
+        """
+        if self._full_array is None:
+            return
+
+        t_center, z_center = self.current_t, self.current_z
+        res = self.current_resolution
+
+        slices = sorted(
+            [(t, z) for t in range(self.dim_t) for z in range(self.dim_z)],
+            key=lambda tz: abs(tz[0] - t_center) + abs(tz[1] - z_center),
+        )
+        total = len(slices)
+        n_tiles_x = (self.width + self._tile_size - 1) // self._tile_size
+        n_tiles_y = (self.height + self._tile_size - 1) // self._tile_size
+        # Report progress at most every 10% to limit websocket traffic
+        report_every = max(1, total // 10)
+
+        for i, (t, z) in enumerate(slices):
+            if cancel_event.is_set():
+                return
+
+            if (t, z, res) not in self._composite_cache:
+                try:
+                    self._get_composite_slice(t, z)
+                except Exception:
+                    pass
+
+            if cancel_event.is_set():
+                return
+
+            for ty in range(n_tiles_y):
+                for tx in range(n_tiles_x):
+                    if cancel_event.is_set():
+                        return
+                    if (t, z, tx, ty, res) not in self._tile_cache:
+                        try:
+                            self._get_tile(t, z, tx, ty)
+                        except Exception:
+                            pass
+
+            if (i + 1) % report_every == 0:
+                self._cache_progress = (i + 1) / total
+
+        self._cache_progress = 1.0
+
+    def _start_precompute(self) -> None:
+        """Cancel any running precompute task and start a fresh one."""
+        if getattr(self, "_precompute_event", None) is not None:
+            self._precompute_event.set()
+
+        if self._full_array is None:
+            return
+
+        self._cache_progress = 0.0
+        event = threading.Event()
+        self._precompute_event = event
+        self._precompute_future = self._prefetch_executor.submit(
+            self._precompute_all_composites, event
+        )
+
     def _prefetch_adjacent_slices(self) -> None:
         """Pre-fetch adjacent Z and T slices in background for smoother scrubbing."""
         if self._bioimage is None:
@@ -402,82 +503,65 @@ class ImageLoadingMixin:
             return
 
         try:
-            # Get visible channels
-            visible_channels = []
-            colors = []
-            mins = []
-            maxs = []
-            data_mins = []
-            data_maxs = []
-
-            # In preview mode, only use cached data (no disk I/O)
+            t, z = self.current_t, self.current_z
+            use_tile_mode = self._use_tile_mode
             preview_mode = self._preview_mode
 
-            for i, ch_settings in enumerate(self._channel_settings):
-                if ch_settings.get("visible", True):
-                    cache_key = (self.current_t, i, self.current_z)
-                    if cache_key in self._slice_cache:
-                        # Use cached data
-                        ch_data = self._slice_cache[cache_key]
-                    elif preview_mode:
-                        # In preview mode, skip uncached channels (don't block on I/O)
-                        # Schedule background load instead
-                        self._prefetch_executor.submit(
-                            self._prefetch_slice, self.current_t, i, self.current_z
-                        )
-                        continue
-                    else:
-                        # Not in preview mode, load from disk
-                        ch_data = self._get_slice_cached(self.current_t, i, self.current_z)
+            if use_tile_mode:
+                # In tile mode, use the composite cache — avoids duplicating compositing work
+                composite = self._get_composite_slice(t, z)
+                if composite is not None:
+                    self._image_array = np.mean(composite, axis=2).astype(np.uint8)
+                    self.image_data = array_to_jpeg_base64(_thumbnail(composite))
+                elif not preview_mode:
+                    self.image_data = ""
+            else:
+                # Non-tile mode: compose channels manually for non-tile rendering path
+                visible_channels, colors, mins, maxs, data_mins, data_maxs = [], [], [], [], [], []
 
-                    visible_channels.append(ch_data)
-                    colors.append(ch_settings.get("color", "#ffffff"))
-                    mins.append(ch_settings.get("min", 0.0))
-                    maxs.append(ch_settings.get("max", 1.0))
-                    data_mins.append(ch_settings.get("data_min"))
-                    data_maxs.append(ch_settings.get("data_max"))
+                for i, ch_settings in enumerate(self._channel_settings):
+                    if ch_settings.get("visible", True):
+                        cache_key = (t, i, z)
+                        if cache_key in self._slice_cache:
+                            ch_data = self._slice_cache[cache_key]
+                        elif preview_mode:
+                            self._prefetch_executor.submit(self._prefetch_slice, t, i, z)
+                            continue
+                        else:
+                            ch_data = self._get_slice_cached(t, i, z)
 
-            use_tile_mode = self._use_tile_mode
+                        visible_channels.append(ch_data)
+                        colors.append(ch_settings.get("color", "#ffffff"))
+                        mins.append(ch_settings.get("min", 0.0))
+                        maxs.append(ch_settings.get("max", 1.0))
+                        data_mins.append(ch_settings.get("data_min"))
+                        data_maxs.append(ch_settings.get("data_max"))
 
-            if not visible_channels:
-                # No visible channels (or all uncached in preview mode)
-                if not preview_mode:
-                    if use_tile_mode:
-                        self.image_data = ""
-                    else:
+                if not visible_channels:
+                    if not preview_mode:
                         normalized = np.zeros((self.height, self.width), dtype=np.uint8)
                         self._image_array = normalized
                         self.image_data = array_to_base64(normalized)
-                return
+                    return
 
-            if len(visible_channels) == 1 and colors[0] == "#ffffff":
-                # Single grayscale channel - no compositing needed
-                global_min = data_mins[0] if data_mins and data_mins[0] is not None else None
-                global_max = data_maxs[0] if data_maxs and data_maxs[0] is not None else None
-                normalized = normalize_image(visible_channels[0], global_min, global_max)
-                # Apply contrast
-                vmin, vmax = mins[0], maxs[0]
-                if vmin > 0 or vmax < 1:
-                    normalized = normalized.astype(np.float64) / 255.0
-                    normalized = np.clip((normalized - vmin) / (vmax - vmin + 1e-10), 0, 1)
-                    normalized = (normalized * 255).astype(np.uint8)
-                self._image_array = normalized
-                if use_tile_mode:
-                    self.image_data = array_to_base64(_thumbnail(normalized))
-                else:
+                if len(visible_channels) == 1 and colors[0] == "#ffffff":
+                    global_min = data_mins[0] if data_mins and data_mins[0] is not None else None
+                    global_max = data_maxs[0] if data_maxs and data_maxs[0] is not None else None
+                    normalized = normalize_image(visible_channels[0], global_min, global_max)
+                    vmin, vmax = mins[0], maxs[0]
+                    if vmin > 0 or vmax < 1:
+                        normalized = normalized.astype(np.float64) / 255.0
+                        normalized = np.clip((normalized - vmin) / (vmax - vmin + 1e-10), 0, 1)
+                        normalized = (normalized * 255).astype(np.uint8)
+                    self._image_array = normalized
                     self.image_data = array_to_base64(normalized)
-            else:
-                # Composite multiple channels
-                composite = composite_channels(visible_channels, colors, mins, maxs, data_mins, data_maxs)
-                # Store grayscale version for SAM
-                self._image_array = np.mean(composite, axis=2).astype(np.uint8)
-                if use_tile_mode:
-                    self.image_data = array_to_base64(_thumbnail(composite))
                 else:
+                    composite = composite_channels(visible_channels, colors, mins, maxs, data_mins, data_maxs)
+                    self._image_array = np.mean(composite, axis=2).astype(np.uint8)
                     self.image_data = array_to_base64(composite)
 
-            # Pre-fetch adjacent slices for smoother navigation (not in preview mode)
-            if not preview_mode:
+            # Pre-fetch adjacent slices only if background precompute hasn't covered them yet
+            if not preview_mode and getattr(self, "_cache_progress", 0.0) < 1.0:
                 self._prefetch_adjacent_slices()
 
         except Exception as e:
@@ -489,14 +573,24 @@ class ImageLoadingMixin:
 
     def _on_channel_settings_change(self, change):
         """Observer callback when channel settings change."""
+        if getattr(self, "_precompute_event", None) is not None:
+            self._precompute_event.set()
         self._tile_cache.clear()
+        composite_cache = getattr(self, "_composite_cache", None)
+        if isinstance(composite_cache, dict):
+            composite_cache.clear()
         self._update_slice()
+        self._start_precompute()
 
-    def _clear_caches(self):
-        """Clear both slice and tile caches (and full array — resolution/scene changed)."""
+    def _clear_caches(self, clear_full_array: bool = True):
+        """Clear all caches. Pass clear_full_array=False to preserve the eager-loaded array."""
         self._slice_cache.clear()
         self._tile_cache.clear()
-        self._full_array = None
+        composite_cache = getattr(self, "_composite_cache", None)
+        if isinstance(composite_cache, dict):
+            composite_cache.clear()
+        if clear_full_array:
+            self._full_array = None
 
     def _on_resolution_change(self, change):
         """Observer callback when resolution level changes."""
@@ -515,7 +609,11 @@ class ImageLoadingMixin:
     def _on_scene_change(self, change):
         """Observer callback when scene changes."""
         new_scene = change.get("new", "")
-        if self._bioimage is None or not new_scene or not hasattr(self._bioimage, "set_scene"):
+        old_scene = change.get("old", "")
+        # Skip if no actual scene change or during initial setup (old was empty)
+        if self._bioimage is None or not new_scene or new_scene == old_scene or not old_scene:
+            return
+        if not hasattr(self._bioimage, "set_scene"):
             return
 
         try:
