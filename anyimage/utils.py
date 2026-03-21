@@ -94,28 +94,29 @@ def array_to_base64(data: np.ndarray) -> str:
     return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
 
-def array_to_jpeg_base64(data: np.ndarray, quality: int = 85) -> str:
-    """Convert numpy array to base64 encoded JPEG — 100× faster than PNG.
+def array_to_fast_png_base64(data: np.ndarray) -> str:
+    """Convert numpy array to base64 encoded PNG using fast (low) compression.
 
-    Suitable for thumbnails/previews where lossless is not required.
-    RGBA input has alpha channel discarded (JPEG does not support transparency).
+    Uses compress_level=1 instead of PIL's default of 6 — 5× faster with only
+    ~20% larger output. Suitable for thumbnails sent frequently during navigation.
 
     Args:
         data: Input array (2D grayscale, 3D RGB, or 3D RGBA)
-        quality: JPEG quality 1–95 (default 85)
 
     Returns:
-        Base64 encoded JPEG string (no data URI prefix).
+        Base64 encoded PNG string (no data URI prefix).
     """
     if data.ndim == 2:
         img = Image.fromarray(data, mode="L")
-    elif data.ndim == 3 and data.shape[2] >= 3:
-        img = Image.fromarray(data[:, :, :3], mode="RGB")
+    elif data.ndim == 3 and data.shape[2] == 3:
+        img = Image.fromarray(data, mode="RGB")
+    elif data.ndim == 3 and data.shape[2] == 4:
+        img = Image.fromarray(data, mode="RGBA")
     else:
         raise ValueError(f"Unsupported array shape: {data.shape}")
 
     buffer = BytesIO()
-    img.save(buffer, format="JPEG", quality=quality)
+    img.save(buffer, format="PNG", compress_level=1)
     return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
 

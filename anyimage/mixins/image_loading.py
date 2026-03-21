@@ -13,7 +13,7 @@ _EAGER_LOAD_BYTES = 2 * 1024 ** 3  # 2 GB
 from ..utils import (
     CHANNEL_COLORS,
     array_to_base64,
-    array_to_jpeg_base64,
+    array_to_fast_png_base64,
     composite_channels,
     normalize_image,
 )
@@ -512,7 +512,7 @@ class ImageLoadingMixin:
                 composite = self._get_composite_slice(t, z)
                 if composite is not None:
                     self._image_array = np.mean(composite, axis=2).astype(np.uint8)
-                    self.image_data = array_to_jpeg_base64(_thumbnail(composite))
+                    self.image_data = array_to_fast_png_base64(_thumbnail(composite))
                 elif not preview_mode:
                     self.image_data = ""
             else:

@@ -128,8 +128,7 @@ class BioImageViewer(
             const img = new Image();
             img.onload = () => resolve(img);
             img.onerror = reject;
-            // Support both plain base64 (PNG) and full data URIs (JPEG thumbnails)
-            img.src = base64Data.startsWith('data:') ? base64Data : 'data:image/png;base64,' + base64Data;
+            img.src = 'data:image/png;base64,' + base64Data;
         });
     }
 
