@@ -726,6 +726,40 @@ class ImageLoadingMixin:
                 "timestamp": timestamp,
             }
 
+    def _on_histogram_request(self, change):
+        """Compute intensity histogram for requested channel(s)."""
+        request = change.get("new")
+        if not request:
+            return
+
+        t = request.get("t", self.current_t)
+        z = request.get("z", self.current_z)
+        channel = request.get("channel", -1)
+        timestamp = request.get("timestamp")
+
+        def compute_histogram(ch_idx):
+            if self._bioimage is not None:
+                ch_data = self._get_slice_cached(t, ch_idx, z)
+            elif hasattr(self, "_raw_numpy_array") and self._raw_numpy_array is not None:
+                ch_data = self._raw_numpy_array
+            else:
+                return [0] * 256
+
+            ch_settings = self._channel_settings[ch_idx]
+            data_min = ch_settings.get("data_min", float(ch_data.min()))
+            data_max = ch_settings.get("data_max", float(ch_data.max()))
+            counts, _ = np.histogram(ch_data.ravel(), bins=256, range=(data_min, data_max))
+            return counts.tolist()
+
+        if channel == -1:
+            histograms = {}
+            for i in range(len(self._channel_settings)):
+                histograms[str(i)] = compute_histogram(i)
+            self._histogram_data = {"channel": -1, "histograms": histograms, "timestamp": timestamp}
+        else:
+            counts = compute_histogram(channel)
+            self._histogram_data = {"channel": channel, "counts": counts, "timestamp": timestamp}
+
     def _on_channel_settings_change(self, change):
         """Observer callback when channel settings change."""
         # For numpy arrays (no BioImage), re-render directly

@@ -108,6 +108,10 @@ class BioImageViewer(
     _auto_contrast_request = traitlets.Dict(allow_none=True).tag(sync=True)
     _auto_contrast_result = traitlets.Dict(allow_none=True).tag(sync=True)
 
+    # Histogram request/response
+    _histogram_request = traitlets.Dict(allow_none=True).tag(sync=True)
+    _histogram_data = traitlets.Dict(allow_none=True).tag(sync=True)
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._mask_arrays = {}  # Store raw label arrays by mask id
@@ -145,6 +149,7 @@ class BioImageViewer(
         self.observe(self._on_tile_request, names=["_tile_request"])
         self.observe(self._on_viewport_change, names=["_viewport_tiles"])
         self.observe(self._on_auto_contrast_request, names=["_auto_contrast_request"])
+        self.observe(self._on_histogram_request, names=["_histogram_request"])
 
     _esm = """
     async function loadImage(base64Data) {
@@ -474,6 +479,17 @@ class BioImageViewer(
                     chRow.appendChild(colorPicker);
                     layersPanel.appendChild(chRow);
 
+                    // Histogram canvas
+                    const histRow = document.createElement('div');
+                    histRow.className = 'layer-item sub-item channel-contrast-row';
+                    const histCanvas = document.createElement('canvas');
+                    histCanvas.className = 'histogram-canvas';
+                    histCanvas.dataset.channel = idx;
+                    histCanvas.width = 256;
+                    histCanvas.height = 40;
+                    histRow.appendChild(histCanvas);
+                    layersPanel.appendChild(histRow);
+
                     // Min slider row
                     const minRow = document.createElement('div');
                     minRow.className = 'layer-item sub-item channel-contrast-row';
@@ -489,13 +505,6 @@ class BioImageViewer(
                     const minValue = document.createElement('span');
                     minValue.className = 'slider-value';
                     minValue.textContent = Math.round((ch.min || 0) * 100) + '%';
-                    minSlider.addEventListener('input', () => {
-                        const settings = [...model.get('_channel_settings')];
-                        settings[idx] = { ...settings[idx], min: parseInt(minSlider.value) / 100 };
-                        model.set('_channel_settings', settings);
-                        model.save_changes();
-                        minValue.textContent = minSlider.value + '%';
-                    });
                     minRow.appendChild(minLabel);
                     minRow.appendChild(minSlider);
                     minRow.appendChild(minValue);
@@ -516,17 +525,32 @@ class BioImageViewer(
                     const maxValue = document.createElement('span');
                     maxValue.className = 'slider-value';
                     maxValue.textContent = Math.round((ch.max || 1) * 100) + '%';
-                    maxSlider.addEventListener('input', () => {
-                        const settings = [...model.get('_channel_settings')];
-                        settings[idx] = { ...settings[idx], max: parseInt(maxSlider.value) / 100 };
-                        model.set('_channel_settings', settings);
-                        model.save_changes();
-                        maxValue.textContent = maxSlider.value + '%';
-                    });
                     maxRow.appendChild(maxLabel);
                     maxRow.appendChild(maxSlider);
                     maxRow.appendChild(maxValue);
                     layersPanel.appendChild(maxRow);
+
+                    // Add clamped event listeners (min cannot exceed max, max cannot go below min)
+                    minSlider.addEventListener('input', () => {
+                        let val = parseInt(minSlider.value);
+                        const maxVal = parseInt(maxSlider.value);
+                        if (val >= maxVal) { val = maxVal - 1; minSlider.value = val; }
+                        const settings = [...model.get('_channel_settings')];
+                        settings[idx] = { ...settings[idx], min: val / 100 };
+                        model.set('_channel_settings', settings);
+                        model.save_changes();
+                        minValue.textContent = val + '%';
+                    });
+                    maxSlider.addEventListener('input', () => {
+                        let val = parseInt(maxSlider.value);
+                        const minVal = parseInt(minSlider.value);
+                        if (val <= minVal) { val = minVal + 1; maxSlider.value = val; }
+                        const settings = [...model.get('_channel_settings')];
+                        settings[idx] = { ...settings[idx], max: val / 100 };
+                        model.set('_channel_settings', settings);
+                        model.save_changes();
+                        maxValue.textContent = val + '%';
+                    });
                 });
             }
 
@@ -692,10 +716,69 @@ class BioImageViewer(
         layersGroup.appendChild(layersBtn);
 
         let panelOpen = false;
+
+        function requestHistograms() {
+            model.set('_histogram_request', {
+                channel: -1,
+                t: model.get('current_t'),
+                z: model.get('current_z'),
+                timestamp: Date.now()
+            });
+            model.save_changes();
+        }
+
+        function drawHistogram(canvas, counts, color) {
+            if (!canvas || !counts || counts.length === 0) return;
+            const ctx2 = canvas.getContext('2d');
+            const w = canvas.width;
+            const h = canvas.height;
+            ctx2.clearRect(0, 0, w, h);
+
+            // Use log scale to prevent dominant peaks from squishing everything
+            const logCounts = counts.map(c => c > 0 ? Math.log(c + 1) : 0);
+            const maxLog = Math.max(...logCounts);
+            if (maxLog === 0) return;
+
+            ctx2.fillStyle = color + '55';  // 33% opacity via hex alpha
+            ctx2.strokeStyle = color + 'aa';
+            ctx2.lineWidth = 1;
+            ctx2.beginPath();
+            ctx2.moveTo(0, h);
+            for (let i = 0; i < logCounts.length; i++) {
+                const x = (i / logCounts.length) * w;
+                const y = h - (logCounts[i] / maxLog) * (h - 2);
+                ctx2.lineTo(x, y);
+            }
+            ctx2.lineTo(w, h);
+            ctx2.closePath();
+            ctx2.fill();
+            ctx2.stroke();
+        }
+
+        model.on('change:_histogram_data', () => {
+            const data = model.get('_histogram_data');
+            if (!data || !panelOpen) return;
+            const settings = model.get('_channel_settings') || [];
+            if (data.channel === -1) {
+                for (const [idx, counts] of Object.entries(data.histograms)) {
+                    const canvas = layersPanel.querySelector(`.histogram-canvas[data-channel="${idx}"]`);
+                    const color = settings[parseInt(idx)]?.color || '#ffffff';
+                    drawHistogram(canvas, counts, color);
+                }
+            } else {
+                const canvas = layersPanel.querySelector(`.histogram-canvas[data-channel="${data.channel}"]`);
+                const color = settings[data.channel]?.color || '#ffffff';
+                drawHistogram(canvas, data.counts, color);
+            }
+        });
+
         layersBtn.addEventListener('click', (e) => {
             e.stopPropagation();
             panelOpen = !panelOpen;
-            if (panelOpen) rebuildLayersPanel();
+            if (panelOpen) {
+                rebuildLayersPanel();
+                requestHistograms();
+            }
             layersPanel.classList.toggle('open', panelOpen);
             layersBtn.classList.toggle('active', panelOpen);
         });
@@ -1681,9 +1764,9 @@ class BioImageViewer(
         model.on('change:scenes', rebuildDimControls);
         model.on('change:plate_wells', rebuildDimControls);
         model.on('change:plate_fovs', rebuildDimControls);
-        model.on('change:current_t', updateDimStatus);
+        model.on('change:current_t', () => { updateDimStatus(); if (panelOpen) requestHistograms(); });
         model.on('change:current_c', updateDimStatus);
-        model.on('change:current_z', updateDimStatus);
+        model.on('change:current_z', () => { updateDimStatus(); if (panelOpen) requestHistograms(); });
 
         // Decode raw RGBA bytes to ImageBitmap (much faster than PNG)
         async function decodeRawTile(tileData) {
@@ -1930,6 +2013,7 @@ class BioImageViewer(
         border-radius: 3px;
         -webkit-appearance: none;
         background: #e0e0e0;
+        cursor: pointer;
     }
     .opacity-item input[type="range"]::-webkit-slider-thumb {
         -webkit-appearance: none;
@@ -1940,6 +2024,7 @@ class BioImageViewer(
         cursor: pointer;
         border: 2px solid #fff;
         box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+        margin-top: -6px;
     }
     .slider-item {
         flex-direction: column;
@@ -1957,6 +2042,7 @@ class BioImageViewer(
         border-radius: 3px;
         -webkit-appearance: none;
         background: linear-gradient(to right, #666 0%, #e0e0e0 50%, #fff 100%);
+        cursor: pointer;
     }
     .adjustment-slider::-webkit-slider-thumb {
         -webkit-appearance: none;
@@ -1967,6 +2053,7 @@ class BioImageViewer(
         cursor: pointer;
         border: 2px solid #fff;
         box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+        margin-top: -6px;
     }
     .adjustment-slider::-moz-range-thumb {
         width: 18px;
@@ -2044,6 +2131,7 @@ class BioImageViewer(
         border-radius: 3px;
         -webkit-appearance: none;
         background: #ddd;
+        cursor: pointer;
     }
     .dim-slider::-webkit-slider-thumb {
         -webkit-appearance: none;
@@ -2054,6 +2142,7 @@ class BioImageViewer(
         cursor: pointer;
         border: 2px solid #fff;
         box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+        margin-top: -6px;
     }
     .dim-slider::-moz-range-thumb {
         width: 18px;
@@ -2126,6 +2215,12 @@ class BioImageViewer(
         background: #e8e8e8;
         border-color: #999;
     }
+    .histogram-canvas {
+        width: 100%;
+        height: 40px;
+        border-radius: 4px;
+        background: #f8f8f8;
+    }
 
     @media (prefers-color-scheme: dark) {
         .bioimage-viewer {
@@ -2169,6 +2264,9 @@ class BioImageViewer(
         .auto-contrast-btn:hover {
             background: #4d4d4d;
             border-color: #777;
+        }
+        .histogram-canvas {
+            background: #333;
         }
         .layer-header {
             color: #888;
