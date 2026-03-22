@@ -169,12 +169,20 @@ class ImageLoadingMixin:
             self.current_c = 0
             self.current_z = 0
 
+            # Read channel names from OME metadata if available
+            try:
+                raw_names = img.channel_names if hasattr(img, "channel_names") else None
+                channel_names = list(raw_names) if raw_names else []
+            except Exception:
+                channel_names = []
+
             # Initialize channel settings with default colors and global ranges
             channel_settings = []
             for i in range(self.dim_c):
                 data_min, data_max = channel_ranges.get(i, (0.0, 1.0))
+                name = channel_names[i] if i < len(channel_names) else f"Channel {i}"
                 channel_settings.append({
-                    "name": f"Channel {i}",
+                    "name": name,
                     "color": "#ffffff" if self.dim_c == 1 else CHANNEL_COLORS[i % len(CHANNEL_COLORS)],
                     "visible": True,
                     "min": 0.0,
@@ -249,34 +257,44 @@ class ImageLoadingMixin:
         z_samples = list(set([0, self.dim_z // 2, self.dim_z - 1]))
 
         for c in range(self.dim_c):
-            global_min = float("inf")
-            global_max = float("-inf")
+            samples = []
 
             for t in t_samples:
                 for z in z_samples:
                     try:
                         slice_data = img.get_image_dask_data("YX", T=t, C=c, Z=z).compute()
-                        slice_min = float(slice_data.min())
-                        slice_max = float(slice_data.max())
-                        global_min = min(global_min, slice_min)
-                        global_max = max(global_max, slice_max)
+                        samples.append(slice_data.ravel())
                     except Exception:
                         continue
 
-            # Fallback if no valid samples
-            if global_min == float("inf") or global_max == float("-inf"):
-                global_min, global_max = 0.0, 1.0
+            if not samples:
+                channel_ranges[c] = (0.0, 1.0)
+                continue
+
+            combined = np.concatenate(samples)
+            global_min = float(np.percentile(combined, 0.5))
+            global_max = float(np.percentile(combined, 99.5))
+            if global_max <= global_min:
+                global_min, global_max = float(combined.min()), float(combined.max())
 
             channel_ranges[c] = (global_min, global_max)
 
         return channel_ranges
 
     def _compute_channel_ranges_from_array(self, arr: np.ndarray) -> dict[int, tuple[float, float]]:
-        """Compute global min/max per channel from an already-loaded TCZYX array."""
+        """Compute p0.5/p99.5 percentile range per channel from an already-loaded TCZYX array.
+
+        Percentile clipping avoids outlier pixels (dead pixels, saturated frames) collapsing
+        the visible contrast range — particularly important for brightfield channels.
+        """
         channel_ranges = {}
         for c in range(arr.shape[1]):
-            ch = arr[:, c, :, :, :]
-            channel_ranges[c] = (float(ch.min()), float(ch.max()))
+            ch = arr[:, c, :, :, :].ravel()
+            lo = float(np.percentile(ch, 0.5))
+            hi = float(np.percentile(ch, 99.5))
+            if hi <= lo:
+                lo, hi = float(ch.min()), float(ch.max())
+            channel_ranges[c] = (lo, hi)
         return channel_ranges
 
     def _get_pyramid_level(self, level: int) -> np.ndarray:
