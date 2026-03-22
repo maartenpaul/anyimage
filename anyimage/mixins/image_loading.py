@@ -102,7 +102,21 @@ class ImageLoadingMixin:
         self.current_z = 0
         self.resolution_levels = []
         self.scenes = []
-        self._channel_settings = []  # No channel controls for simple arrays
+        # Store raw data for re-rendering on LUT/contrast changes
+        self._raw_numpy_array = data
+
+        # Always create channel settings so UI controls are available
+        data_min = float(data.min()) if data.size > 0 else 0.0
+        data_max = float(data.max()) if data.size > 0 else 1.0
+        self._channel_settings = [{
+            "name": "Channel 0",
+            "color": "#ffffff",
+            "visible": True,
+            "min": 0.0,
+            "max": 1.0,
+            "data_min": data_min,
+            "data_max": data_max,
+        }]
         self._bioimage = None
 
         self.image_data = array_to_base64(normalized)
@@ -157,7 +171,7 @@ class ImageLoadingMixin:
                 data_min, data_max = channel_ranges.get(i, (0.0, 1.0))
                 channel_settings.append({
                     "name": f"Channel {i}",
-                    "color": CHANNEL_COLORS[i % len(CHANNEL_COLORS)],
+                    "color": "#ffffff" if self.dim_c == 1 else CHANNEL_COLORS[i % len(CHANNEL_COLORS)],
                     "visible": True,
                     "min": 0.0,
                     "max": 1.0,
@@ -644,8 +658,115 @@ class ImageLoadingMixin:
         """Observer callback when T or Z dimension changes."""
         self._update_slice()
 
+    def _update_numpy_image(self):
+        """Re-render a numpy array image using current channel settings (LUT/contrast)."""
+        raw = getattr(self, "_raw_numpy_array", None)
+        if raw is None:
+            return
+        settings = self._channel_settings
+        if not settings:
+            return
+        ch = settings[0]
+        color = ch.get("color", "#ffffff")
+        vmin = ch.get("min", 0.0)
+        vmax = ch.get("max", 1.0)
+        data_min = ch.get("data_min")
+        data_max = ch.get("data_max")
+
+        composite = composite_channels(
+            [raw], [color], [vmin], [vmax],
+            [data_min], [data_max],
+        )
+        self._image_array = np.mean(composite, axis=2).astype(np.uint8)
+        self.image_data = array_to_base64(composite)
+
+    def _on_auto_contrast_request(self, change):
+        """Compute 2nd-98th percentile contrast for requested channel(s)."""
+        request = change.get("new")
+        if not request:
+            return
+
+        t = request.get("t", self.current_t)
+        z = request.get("z", self.current_z)
+        channel = request.get("channel", -1)
+        timestamp = request.get("timestamp")
+
+        def compute_range(ch_idx):
+            """Compute normalized percentile range for a single channel."""
+            if self._bioimage is not None:
+                ch_data = self._get_slice_cached(t, ch_idx, z)
+            elif hasattr(self, "_raw_numpy_array") and self._raw_numpy_array is not None:
+                ch_data = self._raw_numpy_array
+            else:
+                return {"min": 0.0, "max": 1.0}
+
+            p2, p98 = np.percentile(ch_data, [2, 98])
+            ch_settings = self._channel_settings[ch_idx]
+            data_min = ch_settings.get("data_min", float(ch_data.min()))
+            data_max = ch_settings.get("data_max", float(ch_data.max()))
+            span = data_max - data_min
+            if span > 0:
+                norm_min = (float(p2) - data_min) / span
+                norm_max = (float(p98) - data_min) / span
+            else:
+                norm_min, norm_max = 0.0, 1.0
+            return {"min": max(0.0, norm_min), "max": min(1.0, norm_max)}
+
+        if channel == -1:
+            ranges = {}
+            for i in range(len(self._channel_settings)):
+                ranges[str(i)] = compute_range(i)
+            self._auto_contrast_result = {"channel": -1, "ranges": ranges, "timestamp": timestamp}
+        else:
+            result = compute_range(channel)
+            self._auto_contrast_result = {
+                "channel": channel,
+                "min": result["min"],
+                "max": result["max"],
+                "timestamp": timestamp,
+            }
+
+    def _on_histogram_request(self, change):
+        """Compute intensity histogram for requested channel(s)."""
+        request = change.get("new")
+        if not request:
+            return
+
+        t = request.get("t", self.current_t)
+        z = request.get("z", self.current_z)
+        channel = request.get("channel", -1)
+        timestamp = request.get("timestamp")
+
+        def compute_histogram(ch_idx):
+            if self._bioimage is not None:
+                ch_data = self._get_slice_cached(t, ch_idx, z)
+            elif hasattr(self, "_raw_numpy_array") and self._raw_numpy_array is not None:
+                ch_data = self._raw_numpy_array
+            else:
+                return [0] * 256
+
+            ch_settings = self._channel_settings[ch_idx]
+            data_min = ch_settings.get("data_min", float(ch_data.min()))
+            data_max = ch_settings.get("data_max", float(ch_data.max()))
+            counts, _ = np.histogram(ch_data.ravel(), bins=256, range=(data_min, data_max))
+            return counts.tolist()
+
+        if channel == -1:
+            histograms = {}
+            for i in range(len(self._channel_settings)):
+                histograms[str(i)] = compute_histogram(i)
+            self._histogram_data = {"channel": -1, "histograms": histograms, "timestamp": timestamp}
+        else:
+            counts = compute_histogram(channel)
+            self._histogram_data = {"channel": channel, "counts": counts, "timestamp": timestamp}
+
     def _on_channel_settings_change(self, change):
         """Observer callback when channel settings change."""
+        # For numpy arrays (no BioImage), re-render directly
+        if self._bioimage is None:
+            self._update_numpy_image()
+            return
+
         if getattr(self, "_precompute_event", None) is not None:
             self._precompute_event.set()
         self._tile_cache.clear()

@@ -1,0 +1,32 @@
+site_name: anyimage
+site_description: Interactive bioimage viewer widget for Jupyter and marimo
+repo_url: https://github.com/maartenpaul/anyimage
+repo_name: maartenpaul/anyimage
+
+theme:
+  name: material
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - content.code.copy
+
+markdown_extensions:
+  - admonition
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - tables
+
+nav:
+  - Home: index.md
+  - Getting Started: getting-started.md
+  - Usage:
+    - Images: usage/images.md
+    - Masks & Overlays: usage/masks.md
+    - Annotations: usage/annotations.md
+    - HCS Plates: usage/hcs.md
+    - SAM Integration: usage/sam.md
+  - API Reference: api.md
