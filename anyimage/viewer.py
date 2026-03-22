@@ -6,10 +6,10 @@ import anywidget
 import traitlets
 
 from .mixins import (
+    AnnotationsMixin,
     ImageLoadingMixin,
     MaskManagementMixin,
     PlateLoadingMixin,
-    AnnotationsMixin,
     SAMIntegrationMixin,
 )
 

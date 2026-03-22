@@ -146,8 +146,8 @@ class PlateLoadingMixin:
         image_path = f"{self._plate_path}/{self._current_well_path}/{fov}"
 
         try:
-            from bioio import BioImage
             import bioio_ome_zarr
+            from bioio import BioImage
 
             img = BioImage(image_path, reader=bioio_ome_zarr.Reader)
             self._set_bioimage(img)
