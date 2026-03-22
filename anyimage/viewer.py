@@ -716,6 +716,23 @@ class BioImageViewer(
         layersGroup.appendChild(layersBtn);
 
         let panelOpen = false;
+        let lastHistogramData = null;  // Cache last histogram data for redraws
+
+        function redrawCachedHistograms() {
+            if (!lastHistogramData || !panelOpen) return;
+            const settings = model.get('_channel_settings') || [];
+            if (lastHistogramData.channel === -1) {
+                for (const [idx, counts] of Object.entries(lastHistogramData.histograms)) {
+                    const canvas = layersPanel.querySelector(`.histogram-canvas[data-channel="${idx}"]`);
+                    const color = settings[parseInt(idx)]?.color || '#ffffff';
+                    drawHistogram(canvas, counts, color);
+                }
+            } else {
+                const canvas = layersPanel.querySelector(`.histogram-canvas[data-channel="${lastHistogramData.channel}"]`);
+                const color = settings[lastHistogramData.channel]?.color || '#ffffff';
+                drawHistogram(canvas, lastHistogramData.counts, color);
+            }
+        }
 
         function requestHistograms() {
             model.set('_histogram_request', {
@@ -757,19 +774,9 @@ class BioImageViewer(
 
         model.on('change:_histogram_data', () => {
             const data = model.get('_histogram_data');
-            if (!data || !panelOpen) return;
-            const settings = model.get('_channel_settings') || [];
-            if (data.channel === -1) {
-                for (const [idx, counts] of Object.entries(data.histograms)) {
-                    const canvas = layersPanel.querySelector(`.histogram-canvas[data-channel="${idx}"]`);
-                    const color = settings[parseInt(idx)]?.color || '#ffffff';
-                    drawHistogram(canvas, counts, color);
-                }
-            } else {
-                const canvas = layersPanel.querySelector(`.histogram-canvas[data-channel="${data.channel}"]`);
-                const color = settings[data.channel]?.color || '#ffffff';
-                drawHistogram(canvas, data.counts, color);
-            }
+            if (!data) return;
+            lastHistogramData = data;
+            redrawCachedHistograms();
         });
 
         layersBtn.addEventListener('click', (e) => {
@@ -1737,7 +1744,7 @@ class BioImageViewer(
             clearTileCache();  // Contrast/color changed
             updateDimStatus();
             renderCanvas();
-            if (panelOpen) rebuildLayersPanel();
+            if (panelOpen) { rebuildLayersPanel(); redrawCachedHistograms(); }
         });
         // Auto-contrast response handler
         model.on('change:_auto_contrast_result', () => {
