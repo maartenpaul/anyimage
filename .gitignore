@@ -141,6 +141,9 @@ dmypy.json
 *.tiff
 *.tif
 
+# Marimo session cache
+__marimo__/
+
 # Playwright screenshots
 *.png
 *.jpg
