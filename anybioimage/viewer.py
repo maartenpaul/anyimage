@@ -1,5 +1,6 @@
 """BioImageViewer - Main anywidget for viewing bioimages with multi-dimensional support."""
 
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import anywidget
@@ -101,6 +102,7 @@ class BioImageViewer(
     _tiles_data = traitlets.Dict({}).tag(sync=True)
     _use_tile_mode = traitlets.Bool(False).tag(sync=True)  # Set by JS when tile mode is active
     _cache_progress = traitlets.Float(0.0).tag(sync=True)  # 0.0–1.0 background cache fill progress
+    use_jpeg_tiles = traitlets.Bool(False).tag(sync=True)  # Opt-in lossy JPEG tiles (smaller payload for remote Jupyter)
     # Viewport tile range sent by JS on pan/zoom — used to prioritise precompute
     _viewport_tiles = traitlets.Dict({}).tag(sync=True)
 
@@ -127,12 +129,16 @@ class BioImageViewer(
         self._slice_cache = {}  # LRU cache for slice data: (T, C, Z) -> np.ndarray
         self._slice_cache_max_size = 128  # Max number of cached slices
         self._composite_cache = {}  # (t, z, res) -> uint8 RGB composite of full slice
-        self._composite_cache_max_size = 64  # Max cached composites
+        self._composite_cache_max_size = 64  # Max cached composites (overridden dynamically in _set_bioimage)
+        self._composite_cache_lock = threading.Lock()
         self._tile_cache = {}  # (t, z, tx, ty, res) -> base64 PNG
         self._tile_cache_max_size = 2048  # Max cached tiles (~400MB for your dataset)
+        self._tile_cache_lock = threading.Lock()
         self._prefetch_executor = ThreadPoolExecutor(max_workers=6)  # Background prefetching
         self._precompute_event = None   # threading.Event to cancel background precompute
         self._precompute_future = None  # Future for the running precompute task
+        self._pyramid = None            # list[np.ndarray | None] of TCZYX levels (synthetic pyramid)
+        self._pyramid_has_native = False  # True if image has native resolution levels
 
         # Observer for SAM label deletion
         self.observe(self._on_delete_sam_at, names=["_delete_sam_at"])
@@ -150,6 +156,7 @@ class BioImageViewer(
         self.observe(self._on_viewport_change, names=["_viewport_tiles"])
         self.observe(self._on_auto_contrast_request, names=["_auto_contrast_request"])
         self.observe(self._on_histogram_request, names=["_histogram_request"])
+        self.observe(self._on_jpeg_toggle, names=["use_jpeg_tiles"])
 
     _esm = """
     async function loadImage(base64Data) {
@@ -1781,14 +1788,17 @@ class BioImageViewer(
         model.on('change:current_c', updateDimStatus);
         model.on('change:current_z', () => { updateDimStatus(); if (panelOpen) requestHistograms(); });
 
-        // Decode raw RGBA bytes to ImageBitmap (much faster than PNG)
+        // Decode raw RGBA bytes (or JPEG) to ImageBitmap (much faster than PNG)
         async function decodeRawTile(tileData) {
-            const { w, h, data } = tileData;
+            const { w, h, data, fmt } = tileData;
             const binary = atob(data);
-            const bytes = new Uint8ClampedArray(binary.length);
-            for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-            const imageData = new ImageData(bytes, w, h);
-            return await createImageBitmap(imageData);
+            if (fmt === 'jpeg') {
+                const bytes = new Uint8Array(binary.length);
+                for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+                return await createImageBitmap(new Blob([bytes], { type: 'image/jpeg' }));
+            }
+            const bytes = Uint8ClampedArray.from(binary, c => c.charCodeAt(0));
+            return await createImageBitmap(new ImageData(bytes, w, h));
         }
 
         model.on('change:_tiles_data', async () => {

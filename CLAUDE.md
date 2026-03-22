@@ -216,15 +216,28 @@ await page.waitForTimeout(20000);  // wait for cells to run
 ### Caching architecture
 
 **Python side (image_loading.py):**
-- `_full_array`: full TCZYX numpy array in RAM if ≤2GB (avoids per-slice zarr I/O)
-- `_composite_cache`: `(t, z, res)` → uint8 RGB array, max 64 entries FIFO
-- `_tile_cache`: `(t, z, tx, ty, res)` → `{w, h, data: base64}`, max 2048 entries FIFO
-- `_precompute_all_composites(cancel_event)`: background task, two-pass:
+- `_full_array`: full TCZYX numpy array in RAM if ≤2GB (avoids per-slice zarr I/O); sized using actual `img.dtype.itemsize` (not assumed uint16)
+- `_composite_cache`: `(t, z, res)` → uint8 RGB array; size is dynamic — set in `_set_bioimage` to fit as many T×Z composites as 512 MB allows (up to 1024), recalculated on resolution/scene change
+- `_composite_cache_lock`: `threading.Lock()` — guards cache writes during parallel precompute
+- `_tile_cache`: `(t, z, tx, ty, res)` → `{w, h, data: base64[, fmt: "jpeg"]}`, max 2048 entries FIFO
+- `_tile_cache_lock`: `threading.Lock()` — guards tile cache writes
+- `_pyramid`: list of TCZYX arrays (or `None` placeholders) for synthetic pyramid levels; built in `_set_bioimage` for flat files (TIFF, CZI, ND2) that have no native resolution levels; levels materialised on first access via `_get_pyramid_level(level)`
+- `_pyramid_has_native`: `True` when the BioImage has native resolution levels (OME-Zarr pyramids); `False` for flat files using the synthetic pyramid
+- `_precompute_all_composites(cancel_event)`: background task, two-pass, **parallel** (4 workers via `ThreadPoolExecutor`):
   - **Pass 1** — viewport tiles only, all T/Z slices sorted by Manhattan distance from current position. Makes Z/T scrubbing instant at the current zoom/pan.
   - **Pass 2** — off-screen tiles for all slices. Fills the full cache in the background.
 - Restarts on: `set_image()`, channel settings change, viewport change (pan/zoom settles after 300ms)
 - `_viewport_tiles` traitlet: JS sends `{tx0, ty0, tx1, ty1}` tile range; Python uses it to scope Pass 1
 - `_viewport_tiles_all_cached(t, z)`: returns True when every viewport tile for (t,z) is in `_tile_cache` — used by `_update_slice()` to skip sending a thumbnail when tiles are already ready
+- `use_jpeg_tiles` traitlet (default `False`): opt-in JPEG encoding for tiles (~15–25 KB vs ~349 KB RGBA); useful for remote JupyterHub. Toggle with `viewer.use_jpeg_tiles = True`.
+
+**Synthetic pyramid (`_pyramid`) — flat file zoom-out performance:**
+- Built automatically in `_set_bioimage` when the image has no native resolution levels
+- Level 0 = `_full_array` (full resolution); levels 1 and 2 are `None` until first access (step ×2, ×4)
+- `_get_pyramid_level(level)` materialises on demand: `full_array[:, :, :, ::step, ::step]`
+- `_on_resolution_change` detects synthetic vs native and dispatches accordingly
+- `_clear_caches` resets materialised levels 1+ but preserves `_full_array`
+- JS auto-pyramid selection (already in `_esm`) picks the right level from zoom scale — works for both native and synthetic pyramids
 
 **`_update_slice()` fast path:**
 When `_viewport_tiles_all_cached(t, z)` is True, `_update_slice()` returns immediately without sending `image_data`. This means:
@@ -240,6 +253,7 @@ When `_viewport_tiles_all_cached(t, z)` is True, `_update_slice()` returns immed
 - `getVisibleTiles()`: computes only tiles intersecting current viewport (scale/translateX/translateY)
 - `requestTiles()`: debounced 30ms — coalesces rapid slider calls into one websocket message
 - `reportViewport()`: debounced 300ms after pan/zoom ends, sends tile range to Python to restart precompute
+- `decodeRawTile`: uses `Uint8ClampedArray.from(binary, c => c.charCodeAt(0))` (native V8, ~4× faster than explicit loop); handles `fmt: "jpeg"` via `createImageBitmap(new Blob([bytes], {type: "image/jpeg"}))`
 
 **Thumbnail (baseImage):**
 - Sent as PNG with `compress_level=1` (~16ms vs 81ms for default level 6) on cold T/Z navigation
@@ -247,12 +261,17 @@ When `_viewport_tiles_all_cached(t, z)` is True, `_update_slice()` returns immed
 - Tiles overdraw it at full resolution as they arrive
 - Skipped entirely when viewport tiles are already cached (fast path above)
 
+**Remote zarr precompute (`_precompute_composites_remote`):**
+- Axis-aware: scrubs T or Z only (whichever dimension the user last moved)
+- 4 parallel workers; each pair uses parallel channel fetching → 4×C concurrent S3 GETs
+- Sorted nearest-first so the most useful frames arrive first
+
 ### Expected performance (image.zarr, 10T×3Z×2048×2048)
 
 **Fit-to-screen zoom** (64 tiles/slice visible, all slices = 1920 tiles):
 - `set_image`: ~2s (loads 252MB into RAM, starts precompute)
 - First T/Z navigation: thumbnail in ~20ms, full tiles in ~500ms
-- After precompute Pass 1 (~30s): all T/Z instant from cache (~50ms)
+- After precompute Pass 1 (~8s with 4 workers): all T/Z instant from cache (~50ms)
 
 **4× zoom** (4 tiles/slice visible):
 - Viewport reported after 300ms of holding still
@@ -262,3 +281,7 @@ When `_viewport_tiles_all_cached(t, z)` is True, `_update_slice()` returns immed
 **Play mode:**
 - While precompute Pass 1 is running: thumbnail flash on each frame
 - After Pass 1 complete: pure JS render, no Python involvement, smooth playback
+
+**Flat TIFF/CZI at fit-to-screen (synthetic pyramid level 2, 512×512):**
+- Composite is 16× smaller → ~0.4ms vs ~6ms per slice
+- Pass 1 precompute for 30 T/Z pairs: ~12ms vs ~180ms at full resolution
