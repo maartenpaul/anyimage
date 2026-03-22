@@ -10,6 +10,7 @@ Interactive anywidget for visualizing biological images in Jupyter and marimo no
 - **SAM integration** - Segment Anything Model for interactive segmentation
 - **Tile-based rendering** - Viewport-aware caching: precomputes visible tiles first across all T/Z, then fills the rest off-screen
 - **BioImage format support** - TIFF, OME-Zarr, and other formats via bioio
+- **HCS plate support** - OME-Zarr plate visualization with well and FOV selection
 
 ## Project Structure
 
@@ -23,6 +24,7 @@ anyimage/
     ├── image_loading.py  # Image loading, caching, and prefetching
     ├── mask_management.py # Mask layer operations
     ├── annotations.py    # Annotation data management (ROIs, polygons, points)
+    ├── plate_loading.py  # HCS OME-Zarr plate loading (well/FOV selection)
     └── sam_integration.py # SAM model integration
 ```
 
@@ -52,6 +54,20 @@ viewer.set_image(img)
 viewer
 ```
 
+### HCS Plate Usage
+
+```python
+from anyimage import BioImageViewer
+
+viewer = BioImageViewer()
+viewer.set_plate("plate.zarr")  # OME-Zarr HCS plate
+viewer
+```
+
+The widget adds **Well** and **FOV** dropdown selectors. Changing the well loads its FOV list; changing the FOV loads the corresponding image with full T/Z/channel support.
+
+**Plate traitlets:** `plate_wells`, `plate_fovs`, `current_well`, `current_fov`
+
 ## Key Classes
 
 ### BioImageViewer
@@ -59,6 +75,7 @@ viewer
 The main widget class with these capabilities:
 
 - `set_image(data)` - Load numpy array or BioImage object
+- `set_plate(path)` - Load HCS OME-Zarr plate with well/FOV selection dropdowns
 - `add_mask(labels, name, color, opacity)` - Add mask overlay layer
 - `enable_sam(model_type)` - Enable SAM segmentation
 - `rois_df`, `polygons_df`, `points_df` - Access annotation data as DataFrames

@@ -6,15 +6,17 @@ import anywidget
 import traitlets
 
 from .mixins import (
+    AnnotationsMixin,
     ImageLoadingMixin,
     MaskManagementMixin,
-    AnnotationsMixin,
+    PlateLoadingMixin,
     SAMIntegrationMixin,
 )
 
 
 class BioImageViewer(
     ImageLoadingMixin,
+    PlateLoadingMixin,
     MaskManagementMixin,
     AnnotationsMixin,
     SAMIntegrationMixin,
@@ -55,6 +57,12 @@ class BioImageViewer(
     # Scene support
     scenes = traitlets.List(traitlets.Unicode()).tag(sync=True)
     current_scene = traitlets.Unicode("").tag(sync=True)
+
+    # HCS plate support
+    plate_wells = traitlets.List(traitlets.Unicode()).tag(sync=True)
+    plate_fovs = traitlets.List(traitlets.Unicode()).tag(sync=True)
+    current_well = traitlets.Unicode("").tag(sync=True)
+    current_fov = traitlets.Unicode("").tag(sync=True)
 
     # Channel settings for composite view: [{name, color, visible, min, max}]
     # Colors are hex strings, min/max are 0-1 normalized contrast limits
@@ -101,6 +109,12 @@ class BioImageViewer(
         self._mask_arrays = {}  # Store raw label arrays by mask id
         self._mask_caches = {}  # Cache rendered versions by mask id
         self._bioimage = None  # Store BioImage reference for lazy loading
+        self._plate_path = None  # HCS plate zarr path
+        self._plate_store = None
+        self._plate_metadata = None
+        self._plate_well_paths = []
+        self._current_well_path = None
+        self._current_well_fov_paths = []
         self._full_array = None  # Full TCZYX array when image fits in RAM
         self._slice_cache = {}  # LRU cache for slice data: (T, C, Z) -> np.ndarray
         self._slice_cache_max_size = 128  # Max number of cached slices
@@ -119,6 +133,8 @@ class BioImageViewer(
         self.observe(self._on_dimension_change, names=["current_t", "current_z"])
         self.observe(self._on_resolution_change, names=["current_resolution"])
         self.observe(self._on_scene_change, names=["current_scene"])
+        self.observe(self._on_well_change, names=["current_well"])
+        self.observe(self._on_fov_change, names=["current_fov"])
         self.observe(self._on_channel_settings_change, names=["_channel_settings"])
 
         # Observer for tile-based loading
@@ -743,6 +759,36 @@ class BioImageViewer(
             return wrapper;
         }
 
+        function createPlateSelector(label, listKey, currentKey) {
+            const wrapper = document.createElement('div');
+            wrapper.className = 'scene-selector-wrapper';
+
+            const labelEl = document.createElement('span');
+            labelEl.className = 'dim-label';
+            labelEl.textContent = label;
+
+            const select = document.createElement('select');
+            select.className = 'scene-select';
+
+            const items = model.get(listKey) || [];
+            items.forEach(item => {
+                const opt = document.createElement('option');
+                opt.value = item;
+                opt.textContent = item;
+                if (item === model.get(currentKey)) opt.selected = true;
+                select.appendChild(opt);
+            });
+
+            select.addEventListener('change', () => {
+                model.set(currentKey, select.value);
+                model.save_changes();
+            });
+
+            wrapper.appendChild(labelEl);
+            wrapper.appendChild(select);
+            return wrapper;
+        }
+
         function createChannelControls() {
             const wrapper = document.createElement('div');
             wrapper.className = 'channel-controls';
@@ -894,11 +940,19 @@ class BioImageViewer(
             const dimC = model.get('dim_c') || 1;
             const dimZ = model.get('dim_z') || 1;
             const scenes = model.get('scenes') || [];
+            const plateWells = model.get('plate_wells') || [];
+            const plateFovs = model.get('plate_fovs') || [];
 
             // Only show controls if we have multi-dimensional data
-            const hasMultiDim = dimT > 1 || dimC > 1 || dimZ > 1 || scenes.length > 1;
+            const hasMultiDim = dimT > 1 || dimC > 1 || dimZ > 1 || scenes.length > 1 || plateWells.length > 0;
             dimControls.style.display = hasMultiDim ? 'flex' : 'none';
 
+            if (plateWells.length > 0) {
+                dimControls.appendChild(createPlateSelector('Well', 'plate_wells', 'current_well'));
+            }
+            if (plateFovs.length > 0) {
+                dimControls.appendChild(createPlateSelector('FOV', 'plate_fovs', 'current_fov'));
+            }
             if (scenes.length > 1) {
                 dimControls.appendChild(createSceneSelector());
             }
@@ -1677,6 +1731,8 @@ class BioImageViewer(
         });
         model.on('change:dim_z', rebuildDimControls);
         model.on('change:scenes', rebuildDimControls);
+        model.on('change:plate_wells', rebuildDimControls);
+        model.on('change:plate_fovs', rebuildDimControls);
         model.on('change:current_t', updateDimStatus);
         model.on('change:current_c', updateDimStatus);
         model.on('change:current_z', updateDimStatus);
