@@ -1,7 +1,7 @@
 import marimo
 
 __generated_with = "0.21.1"
-app = marimo.App(width="medium")
+app = marimo.App(width="full")
 
 
 @app.cell
@@ -26,15 +26,23 @@ def _(BioImage, bioio_ome_zarr):
     #mask = BioImage("examples/mask.tif", reader=bioio_tifffile.Reader)
 
     img.shape
-    return (img,)
+    return
 
 
 @app.cell
-def _(BioImageViewer, img, mo):
+def _(BioImage):
+    path = "https://allencell.s3.amazonaws.com/aics/nuc-morph-dataset/hipsc_fov_nuclei_timelapse_dataset/hipsc_fov_nuclei_timelapse_data_used_for_analysis/baseline_colonies_fov_timelapse_dataset/20200323_09_small/raw.ome.zarr"
+    image = BioImage(path)
+    print(image.get_image_dask_data())
+    return (image,)
+
+
+@app.cell
+def _(BioImageViewer, image, mo):
     viewer = BioImageViewer()
     # Pass BioImage directly for lazy loading and 5D support
     # This enables T, Z, C sliders when the image has multiple dimensions
-    viewer.set_image(img)
+    viewer.set_image(image)
 
     # Add multiple mask layers with different colors and settings
     # Each mask can have its own name, color, opacity, and visibility

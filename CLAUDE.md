@@ -223,6 +223,7 @@ await page.waitForTimeout(20000);  // wait for cells to run
 - `_tile_cache_lock`: `threading.Lock()` — guards tile cache writes
 - `_pyramid`: list of TCZYX arrays (or `None` placeholders) for synthetic pyramid levels; built in `_set_bioimage` for flat files (TIFF, CZI, ND2) that have no native resolution levels; levels materialised on first access via `_get_pyramid_level(level)`
 - `_pyramid_has_native`: `True` when the BioImage has native resolution levels (OME-Zarr pyramids); `False` for flat files using the synthetic pyramid
+- **Channel range computation**: `_compute_channel_ranges` (remote) and `_compute_channel_ranges_from_array` (in-RAM) return `(abs_min, abs_max, display_lo, display_hi)` per channel. `abs_min`/`abs_max` = true data range (no clipping); `display_lo`/`display_hi` = percentile-based initial display window (p1/p99 for remote samples, p0.5/p99.5 for full in-RAM array). This fixes brightfield channels in timelapses where intensity varies across T — cells that are darker than the sampled-percentile threshold no longer clip to black.
 - `_precompute_all_composites(cancel_event)`: background task, two-pass, **parallel** (4 workers via `ThreadPoolExecutor`):
   - **Pass 1** — viewport tiles only, all T/Z slices sorted by Manhattan distance from current position. Makes Z/T scrubbing instant at the current zoom/pan.
   - **Pass 2** — off-screen tiles for all slices. Fills the full cache in the background.

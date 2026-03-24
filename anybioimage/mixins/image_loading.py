@@ -179,16 +179,20 @@ class ImageLoadingMixin:
             # Initialize channel settings with default colors and global ranges
             channel_settings = []
             for i in range(self.dim_c):
-                data_min, data_max = channel_ranges.get(i, (0.0, 1.0))
+                range_data = channel_ranges.get(i, (0.0, 1.0, 0.0, 1.0))
+                abs_min, abs_max, display_lo, display_hi = range_data
+                span = abs_max - abs_min
+                vmin = max(0.0, (display_lo - abs_min) / span) if span > 0 else 0.0
+                vmax = min(1.0, (display_hi - abs_min) / span) if span > 0 else 1.0
                 name = channel_names[i] if i < len(channel_names) else f"Channel {i}"
                 channel_settings.append({
                     "name": name,
                     "color": "#ffffff" if self.dim_c == 1 else CHANNEL_COLORS[i % len(CHANNEL_COLORS)],
                     "visible": True,
-                    "min": 0.0,
-                    "max": 1.0,
-                    "data_min": float(data_min),
-                    "data_max": float(data_max),
+                    "min": vmin,
+                    "max": vmax,
+                    "data_min": abs_min,
+                    "data_max": abs_max,
                 })
             self._channel_settings = channel_settings
 
@@ -238,7 +242,7 @@ class ImageLoadingMixin:
         self._update_slice()
         self._start_precompute()
 
-    def _compute_channel_ranges(self, img) -> dict[int, tuple[float, float]]:
+    def _compute_channel_ranges(self, img) -> dict[int, tuple[float, float, float, float]]:
         """Compute global min/max ranges for each channel by sampling slices.
 
         Samples slices across T and Z dimensions to estimate the global data range
@@ -268,33 +272,38 @@ class ImageLoadingMixin:
                         continue
 
             if not samples:
-                channel_ranges[c] = (0.0, 1.0)
+                channel_ranges[c] = (0.0, 1.0, 0.0, 1.0)
                 continue
 
             combined = np.concatenate(samples)
-            global_min = float(np.percentile(combined, 0.5))
-            global_max = float(np.percentile(combined, 99.5))
-            if global_max <= global_min:
-                global_min, global_max = float(combined.min()), float(combined.max())
+            abs_min = float(combined.min())
+            abs_max = float(combined.max())
+            display_lo = float(np.percentile(combined, 1))
+            display_hi = float(np.percentile(combined, 99))
+            if display_hi <= display_lo:
+                display_lo, display_hi = abs_min, abs_max
 
-            channel_ranges[c] = (global_min, global_max)
+            channel_ranges[c] = (abs_min, abs_max, display_lo, display_hi)
 
         return channel_ranges
 
-    def _compute_channel_ranges_from_array(self, arr: np.ndarray) -> dict[int, tuple[float, float]]:
-        """Compute p0.5/p99.5 percentile range per channel from an already-loaded TCZYX array.
+    def _compute_channel_ranges_from_array(self, arr: np.ndarray) -> dict[int, tuple[float, float, float, float]]:
+        """Compute absolute range and display window per channel from a TCZYX array.
 
-        Percentile clipping avoids outlier pixels (dead pixels, saturated frames) collapsing
-        the visible contrast range — particularly important for brightfield channels.
+        Returns (abs_min, abs_max, display_lo, display_hi) per channel where
+        abs_min/abs_max span the full data range (no clipping) and display_lo/hi
+        are p0.5/p99.5 percentiles used to set the initial contrast window.
         """
         channel_ranges = {}
         for c in range(arr.shape[1]):
             ch = arr[:, c, :, :, :].ravel()
+            abs_min = float(ch.min())
+            abs_max = float(ch.max())
             lo = float(np.percentile(ch, 0.5))
             hi = float(np.percentile(ch, 99.5))
             if hi <= lo:
-                lo, hi = float(ch.min()), float(ch.max())
-            channel_ranges[c] = (lo, hi)
+                lo, hi = abs_min, abs_max
+            channel_ranges[c] = (abs_min, abs_max, lo, hi)
         return channel_ranges
 
     def _get_pyramid_level(self, level: int) -> np.ndarray:
